@@ -2,6 +2,7 @@
 name: Daily Sentiment Scrape
 
 on:
+  workflow_dispatch:    # ← allows “Run workflow” on GitHub
   # Runs every day at 03:00 UTC (adjust if you want local time)
   schedule:
     - cron: '0 3 * * *'
