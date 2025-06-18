@@ -28,11 +28,5 @@ jobs:
 
       - run: npm ci
 
-      # 👇 Quick debug to prove the var is set (it’ll print "***" if it's there)
-      - name: Debug API-key presence
-        run: |
-          echo "GEN_API_KEY: $GOOGLE_GENERATIVE_AI_API_KEY"
-          test -n "$GOOGLE_GENERATIVE_AI_API_KEY" || (echo "❌ Missing!" && exit 1)
-
       - name: Run scraper
         run: npx ts-node sentiment-scraper.ts
