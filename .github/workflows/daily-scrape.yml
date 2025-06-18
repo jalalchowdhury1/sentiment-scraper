@@ -26,7 +26,8 @@ jobs:
       - name: Run scraper
         run: npx ts-node sentiment-scraper.ts
         env:
-          GOOGLE_API_KEY:        ${{ secrets.GOOGLE_API_KEY }}
-          BROWSERBASE_API_KEY:   ${{ secrets.BROWSERBASE_API_KEY }}
-          BROWSERBASE_PROJECT_ID: ${{ secrets.BROWSERBASE_PROJECT_ID }}
-          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+         GOOGLE_API_KEY:               ${{ secrets.GOOGLE_API_KEY }}
+         GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+         BROWSERBASE_API_KEY:          ${{ secrets.BROWSERBASE_API_KEY }}
+         BROWSERBASE_PROJECT_ID:       ${{ secrets.BROWSERBASE_PROJECT_ID }}
+         GOOGLE_SHEETS_CREDENTIALS:    ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
