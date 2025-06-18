@@ -1,33 +1,38 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow
 name: Daily Sentiment Scrape
 
+# …
 on:
-  workflow_dispatch:    # ← allows “Run workflow” on GitHub
-  # Runs every day at 03:00 UTC (adjust if you want local time)
+  workflow_dispatch:
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 8 * * *'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
+    # 👇 Job-level env ensures every step sees these
+    env:
+      GOOGLE_API_KEY:               ${{ secrets.GOOGLE_API_KEY }}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      BROWSERBASE_API_KEY:          ${{ secrets.BROWSERBASE_API_KEY }}
+      BROWSERBASE_PROJECT_ID:       ${{ secrets.BROWSERBASE_PROJECT_ID }}
+      GOOGLE_SHEETS_CREDENTIALS:    ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+
     steps:
-      - name: Check out code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
+      - uses: actions/setup-node@v3
         with:
-          node-version: '24'
+          node-version: '18'
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
+
+      # 👇 Quick debug to prove the var is set (it’ll print "***" if it's there)
+      - name: Debug API-key presence
+        run: |
+          echo "GEN_API_KEY: $GOOGLE_GENERATIVE_AI_API_KEY"
+          test -n "$GOOGLE_GENERATIVE_AI_API_KEY" || (echo "❌ Missing!" && exit 1)
 
       - name: Run scraper
         run: npx ts-node sentiment-scraper.ts
-        env:
-         GOOGLE_API_KEY:               ${{ secrets.GOOGLE_API_KEY }}
-         GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-         BROWSERBASE_API_KEY:          ${{ secrets.BROWSERBASE_API_KEY }}
-         BROWSERBASE_PROJECT_ID:       ${{ secrets.BROWSERBASE_PROJECT_ID }}
-         GOOGLE_SHEETS_CREDENTIALS:    ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
