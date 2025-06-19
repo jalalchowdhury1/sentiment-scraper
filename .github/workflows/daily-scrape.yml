@@ -5,7 +5,7 @@ name: Daily Sentiment Scrape
 on:
   workflow_dispatch:
   schedule:
-    - cron: '1 8 * * *'   # 08:01 UTC = 04:01 EDT
+    - cron: '*/5 * * * *'   # 08:01 UTC = 04:01 EDT
 
 jobs:
   scrape:
