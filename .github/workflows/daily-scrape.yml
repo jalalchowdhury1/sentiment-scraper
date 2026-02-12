@@ -4,12 +4,19 @@ name: Daily Sentiment Scrape
 # …
 on:
   workflow_dispatch:
+    inputs:
+      retry_count:
+        description: 'Number of retry attempts so far'
+        required: false
+        default: '0'
   schedule:
-    - cron: '0 8 * * *'   # 08:01 UTC = 04:01 EDT
+    - cron: '0 8 * * *'   # 08:00 UTC = 04:00 EDT
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write  # Allow triggering workflow_dispatch on retry
 
     # 👇 Job-level env ensures every step sees these
     env:
@@ -29,4 +36,37 @@ jobs:
       - run: npm ci
 
       - name: Run scraper
+        id: scraper
         run: npx ts-node sentiment-scraper.ts
+        continue-on-error: true
+
+      - name: Retry on failure
+        if: steps.scraper.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RETRY_COUNT: ${{ github.event.inputs.retry_count || '0' }}
+          MAX_RETRIES: 10  # 10 retries × 15 min = 2.5 hours max
+        run: |
+          CURRENT_RETRY=$((RETRY_COUNT))
+          NEXT_RETRY=$((CURRENT_RETRY + 1))
+
+          echo "Scraper failed on attempt $((CURRENT_RETRY + 1))"
+
+          if [ $CURRENT_RETRY -lt $MAX_RETRIES ]; then
+            echo "Scheduling retry $NEXT_RETRY in 15 minutes..."
+            sleep 900  # 15 minutes = 900 seconds
+
+            echo "Triggering retry attempt $NEXT_RETRY..."
+            gh workflow run daily-scrape.yml \
+              --ref ${{ github.ref_name }} \
+              -f retry_count=$NEXT_RETRY
+
+            echo "Retry scheduled successfully"
+          else
+            echo "Max retries ($MAX_RETRIES) reached. Giving up."
+            exit 1
+          fi
+
+      - name: Mark as failed if scraper failed
+        if: steps.scraper.outcome == 'failure'
+        run: exit 1
