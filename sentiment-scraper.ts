@@ -88,9 +88,7 @@ export async function layer2Screenshot(page: Page): Promise<SentRow | null> {
   const screenshotBuf = await page.screenshot({ fullPage: false });
 
   const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY!);
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash-preview-05-20",
-  });
+  const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
 
   const imagePart = {
     inlineData: {
@@ -118,78 +116,66 @@ Reply with ONLY valid JSON, no markdown, no explanation:
   };
 }
 
-// ── Layer 3a: Browser DOM extraction ─────────────────────────────────────────
-async function layer3Dom(page: Page): Promise<SentRow | null> {
-  await page.waitForFunction(
-    () => {
-      const tables = Array.from(document.querySelectorAll("table"));
-      return tables.some((t) => {
-        const txt = t.textContent ?? "";
-        return /Reported Date/i.test(txt) && /Bullish/i.test(txt);
-      });
-    },
-    { timeout: 8000 }
-  );
-
-  const row = await page.evaluate(() => {
-    const tables = Array.from(document.querySelectorAll("table"));
-    const target = tables.find((t) => {
-      const txt = t.textContent ?? "";
-      return (
-        /Reported Date/i.test(txt) &&
-        /Bullish/i.test(txt) &&
-        /Bearish/i.test(txt)
-      );
-    });
-    if (!target) return null;
-
-    for (const tr of Array.from(target.querySelectorAll("tr"))) {
-      const tds = Array.from(tr.querySelectorAll("td"));
-      if (tds.length < 4) continue;
-      const cells = tds.map((td) => td.textContent?.trim() ?? "");
-      if (!cells.every((c) => c.length > 0)) continue;
-      if (/Reported Date/i.test(cells.join("|"))) continue;
-      return { date: cells[0], bull: cells[1], neu: cells[2], bear: cells[3] };
-    }
-    return null;
-  });
-
-  if (!row) return null;
-  return {
-    reportedDate: row.date,
-    bullish: pctToNum(row.bull),
-    neutral: pctToNum(row.neu),
-    bearish: pctToNum(row.bear),
-    source: "aaii-dom",
-  };
-}
-
-// ── Layer 3b: Browser innerText + regex ──────────────────────────────────────
-async function layer3Regex(page: Page): Promise<SentRow | null> {
-  const text: string = await page.evaluate(() => document.body.innerText);
-  // Dates on this page are "Mar 25" or "Mar 25, 2026"
-  const rx =
-    /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)%/;
-  const m = text.match(rx);
-  if (!m) return null;
-  return {
-    reportedDate: m[1].trim(),
-    bullish: parseFloat(m[2]),
-    neutral: parseFloat(m[3]),
-    bearish: parseFloat(m[4]),
-    source: "aaii-regex",
-  };
-}
-
-// ── Layer 3: Browser (DOM then regex) ────────────────────────────────────────
+// ── Layer 3: Browser (DOM then regex, no blocking wait) ──────────────────────
 export async function layer3Browser(page: Page): Promise<SentRow | null> {
+  // 3a: DOM table extraction — no waitForFunction, evaluate directly
   try {
-    const row = await layer3Dom(page);
-    if (row) return row;
+    const row = await page.evaluate(() => {
+      const tables = Array.from(document.querySelectorAll("table"));
+      const target = tables.find((t) => {
+        const txt = t.textContent ?? "";
+        return /Reported Date/i.test(txt) && /Bullish/i.test(txt) && /Bearish/i.test(txt);
+      });
+      if (!target) return null;
+
+      for (const tr of Array.from(target.querySelectorAll("tr"))) {
+        const tds = Array.from(tr.querySelectorAll("td"));
+        if (tds.length < 4) continue;
+        const cells = tds.map((td) => td.textContent?.trim() ?? "");
+        if (!cells.every((c) => c.length > 0)) continue;
+        if (/Reported Date/i.test(cells.join("|"))) continue;
+        return { date: cells[0], bull: cells[1], neu: cells[2], bear: cells[3] };
+      }
+      return null;
+    });
+
+    if (row) {
+      return {
+        reportedDate: row.date,
+        bullish: pctToNum(row.bull),
+        neutral: pctToNum(row.neu),
+        bearish: pctToNum(row.bear),
+        source: "aaii-dom",
+      };
+    }
+    console.warn("  Layer 3 DOM: no matching table found");
   } catch (e) {
-    console.warn("  Layer 3 DOM attempt failed:", (e as Error).message);
+    console.warn("  Layer 3 DOM failed:", (e as Error).message);
   }
-  return layer3Regex(page);
+
+  // 3b: regex on rendered innerText
+  try {
+    const text: string = await page.evaluate(() => document.body.innerText);
+    // Log first 300 chars so we can diagnose what the browser is seeing
+    console.warn("  Layer 3 page text preview:", text.substring(0, 300).replace(/\n+/g, " "));
+
+    const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)%/;
+    const m = text.match(rx);
+    if (m) {
+      return {
+        reportedDate: m[1].trim(),
+        bullish: parseFloat(m[2]),
+        neutral: parseFloat(m[3]),
+        bearish: parseFloat(m[4]),
+        source: "aaii-regex",
+      };
+    }
+    console.warn("  Layer 3 regex: no date+percentage pattern found in rendered text");
+  } catch (e) {
+    console.warn("  Layer 3 regex failed:", (e as Error).message);
+  }
+
+  return null;
 }
 
 // ── Stagehand config ──────────────────────────────────────────────────────────
