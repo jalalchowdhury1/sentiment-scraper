@@ -2,6 +2,7 @@ import "dotenv/config";
 import { chromium, Browser, Page } from "playwright";
 import { google } from "googleapis";
 import fs from "node:fs/promises";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const AAII_URL = "https://www.aaii.com/sentimentsurvey/sent_results";
 
@@ -276,6 +277,96 @@ export async function layer3Alternative(page: Page): Promise<SentRow | null> {
   return null;
 }
 
+// ── Layer 4: Vision LLM Extraction ──────────────────────────────────────────
+export async function layer4VisionLLM(page: Page): Promise<SentRow | null> {
+  console.log("  [Layer 4] Vision LLM extraction (Gemini Flash)...");
+
+  const apiKey = process.env.GOOGLE_API_KEY;
+  if (!apiKey) {
+    console.log("  [Layer 4] No GOOGLE_API_KEY found, skipping");
+    return null;
+  }
+
+  try {
+    // Take screenshot of the page
+    console.log("  [Layer 4] Taking screenshot...");
+    const screenshot = await page.screenshot({ fullPage: true });
+    const base64Image = screenshot.toString("base64");
+
+    // Initialize Gemini
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+    // Send to LLM with vision
+    console.log("  [Layer 4] Sending to Gemini Flash...");
+    const result = await model.generateContent([
+      `This is an AAII sentiment survey page. Please extract the sentiment data:
+      - The reported date (e.g., "Mar 25")
+      - Bullish percentage
+      - Neutral percentage  
+      - Bearish percentage
+      
+      Return ONLY a JSON object with this exact format, nothing else:
+      {"date": "Mar 25", "bullish": 32.1, "neutral": 18.1, "bearish": 49.8}
+      
+      If you cannot find the data, return: {"error": "no data found"}`,
+      {
+        inlineData: {
+          data: base64Image,
+          mimeType: "image/png",
+        },
+      }
+    ]);
+
+    const response = result.response;
+    const text = response.text().trim();
+    console.log(`  [Layer 4] LLM response: ${text}`);
+
+    // Parse the JSON response
+    let data: any;
+    try {
+      // Try to extract JSON from the response (handle markdown code blocks)
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        data = JSON.parse(jsonMatch[0]);
+      } else {
+        data = JSON.parse(text);
+      }
+    } catch {
+      console.log("  [Layer 4] Failed to parse LLM response as JSON");
+      return null;
+    }
+
+    if (data.error || !data.date || !data.bullish || !data.neutral || !data.bearish) {
+      console.log("  [Layer 4] LLM did not find valid data");
+      return null;
+    }
+
+    const bullish = parseFloat(data.bullish);
+    const neutral = parseFloat(data.neutral);
+    const bearish = parseFloat(data.bearish);
+    const sum = bullish + neutral + bearish;
+
+    if (Math.abs(sum - 100) <= 1) {
+      console.log(`  [Layer 4] SUCCESS: ${data.date} ${bullish}/${neutral}/${bearish}`);
+      return {
+        reportedDate: data.date,
+        bullish,
+        neutral,
+        bearish,
+        source: "aaii-vision-llm"
+      };
+    } else {
+      console.log(`  [Layer 4] Validation failed: sum ${sum.toFixed(1)} != 100`);
+      return null;
+    }
+
+  } catch (e: any) {
+    console.log(`  [Layer 4] Error: ${e.message}`);
+    return null;
+  }
+}
+
 // ── Main scraping function (runs all 3 layers) ────────────────────────────────
 export async function scrapeAAII(): Promise<SentRow | null> {
   let browser: Browser | null = null;
@@ -299,6 +390,11 @@ export async function scrapeAAII(): Promise<SentRow | null> {
 
     // ── Layer 3: Alternative ──
     result = await layer3Alternative(page);
+    if (result) return result;
+
+    // ── Layer 4: Vision LLM ──
+    console.log("\n  ⚠️  Layers 1-3 failed, trying Vision LLM (Layer 4)...");
+    result = await layer4VisionLLM(page);
     if (result) return result;
 
     // Save debug info

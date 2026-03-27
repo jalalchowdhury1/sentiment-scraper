@@ -1,13 +1,13 @@
 /**
  * test-layers.ts
- * Runs all 3 extraction layers independently and reports pass/fail.
+ * Runs all 4 extraction layers independently and reports pass/fail.
  * Does NOT write to Google Sheets.
  *
  * Usage:  npx ts-node test-layers.ts
  */
 import "dotenv/config";
 import { chromium } from "playwright";
-import { layer1DOMTable, layer2TextRegex, layer3Alternative } from "./sentiment-scraper";
+import { layer1DOMTable, layer2TextRegex, layer3Alternative, layer4VisionLLM } from "./sentiment-scraper";
 
 const AAII_URL = "https://www.aaii.com/sentimentsurvey/sent_results";
 
@@ -46,7 +46,7 @@ async function main() {
   const results: Result[] = [];
   let browser = null;
 
-  console.log("\n═══ AAII Sentiment Scraper - 3 Layers ═══\n");
+  console.log("\n═══ AAII Sentiment Scraper - 4 Layers ═══\n");
 
   try {
     // Launch browser once
@@ -100,6 +100,17 @@ async function main() {
       console.log(`  ✗ FAIL: ${results[2].error}`);
     }
 
+    // ── Layer 4: Vision LLM ──
+    console.log("\n── Layer 4: Vision LLM Extraction ────────────────");
+    const l4 = await runLayer("Layer 4 (vision LLM)", layer4VisionLLM, page, results);
+    if (l4) {
+      const r = results[3];
+      console.log("  ✓ PASS");
+      console.log(`  → ${r.data.reportedDate}: ${r.data.bullish}% / ${r.data.neutral}% / ${r.data.bearish}%`);
+    } else {
+      console.log(`  ✗ FAIL: ${results[3]?.error || "returned null"}`);
+    }
+
   } catch (e: any) {
     console.error("Browser error:", e.message);
   } finally {
@@ -116,10 +127,10 @@ async function main() {
   }
   console.log("════════════════════════════════════════════════");
 
-  if (passed === 3) {
-    console.log("\n✓ ALL 3 LAYERS PASSED!");
+  if (passed === 4) {
+    console.log("\n✓ ALL 4 LAYERS PASSED!");
   } else {
-    console.log(`\n⚠ ${passed}/3 layers passed`);
+    console.log(`\n⚠ ${passed}/4 layers passed`);
     process.exit(1);
   }
 }

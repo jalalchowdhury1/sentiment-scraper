@@ -31,3 +31,5 @@ jobs:
       - run: npx ts-node sentiment-scraper.ts
         env:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
