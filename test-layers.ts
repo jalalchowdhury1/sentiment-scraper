@@ -7,7 +7,7 @@
  */
 import "dotenv/config";
 import { Stagehand, type ConstructorParams } from "@browserbasehq/stagehand";
-import { layer1Direct, layer2Screenshot, layer3Browser } from "./sentiment-scraper";
+import { layer1Direct, layer2Alternative, layer3Stagehand } from "./sentiment-scraper";
 
 const AAII_URL = "https://www.aaii.com/sentimentsurvey/sent_results";
 
@@ -50,8 +50,8 @@ async function main() {
 
   if (!process.env.BROWSERBASE_API_KEY) {
     console.log("⚠ BROWSERBASE_API_KEY not set — skipping browser layers (CI only)");
-    results.push({ layer: "Layer 2 (screenshot→LLM)", ok: false, error: "BROWSERBASE_API_KEY not set" });
-    results.push({ layer: "Layer 3 (DOM+regex)", ok: false, error: "BROWSERBASE_API_KEY not set" });
+    results.push({ layer: "Layer 2 (alternative URLs)", ok: false, error: "BROWSERBASE_API_KEY not set" });
+    results.push({ layer: "Layer 3 (Stagehand)", ok: false, error: "BROWSERBASE_API_KEY not set" });
   } else {
     let stagehand: Stagehand | null = null;
     try {
@@ -68,8 +68,8 @@ async function main() {
       await page.goto(AAII_URL, { waitUntil: "load" });
       await new Promise((r) => setTimeout(r, 3000));
 
-      await run("Layer 2 (screenshot→LLM)", () => layer2Screenshot(page), results);
-      await run("Layer 3 (DOM+regex)", () => layer3Browser(page), results);
+      await run("Layer 2 (alternative URLs)", () => layer2Alternative(page), results);
+      await run("Layer 3 (Stagehand)", () => layer3Stagehand(stagehand!), results);
     } catch (e) {
       console.error("Browser init failed:", e);
       results.push({ layer: "Layers 2+3 (browser)", ok: false, error: String(e) });
