@@ -300,16 +300,16 @@ export async function layer4VisionLLM(page: Page): Promise<SentRow | null> {
     // Send to LLM with vision
     console.log("  [Layer 4] Sending to Gemini Flash...");
     const result = await model.generateContent([
-      `This is an AAII sentiment survey page. Please extract the sentiment data:
-      - The reported date (e.g., "Mar 25")
-      - Bullish percentage
-      - Neutral percentage  
-      - Bearish percentage
-      
-      Return ONLY a JSON object with this exact format, nothing else:
-      {"date": "Mar 25", "bullish": 32.1, "neutral": 18.1, "bearish": 49.8}
-      
-      If you cannot find the data, return: {"error": "no data found"}`,
+      `You are looking at an AAII Investor Sentiment Survey webpage. 
+
+Look carefully at the table on the page. You should see:
+- A column with "Reported Date" and dates like "Mar 25"
+- Three columns showing percentages for "Bullish", "Neutral", and "Bearish"
+
+Please extract the FIRST data row (most recent) and return it as JSON:
+{"date": "Mar 25", "bullish": 32.1, "neutral": 18.1, "bearish": 49.8}
+
+If you cannot find the sentiment data table, return: {"error": "no data found"}`,
       {
         inlineData: {
           data: base64Image,
