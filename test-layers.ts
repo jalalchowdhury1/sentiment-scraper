@@ -1,12 +1,15 @@
 /**
  * test-layers.ts
- * Runs the Playwright-based scraper and reports pass/fail.
+ * Runs all 3 extraction layers independently and reports pass/fail.
  * Does NOT write to Google Sheets.
  *
  * Usage:  npx ts-node test-layers.ts
  */
 import "dotenv/config";
-import { scrapeAAII } from "./sentiment-scraper";
+import { chromium } from "playwright";
+import { layer1DOMTable, layer2TextRegex, layer3Alternative } from "./sentiment-scraper";
+
+const AAII_URL = "https://www.aaii.com/sentimentsurvey/sent_results";
 
 type Result = { layer: string; ok: boolean; data?: any; error?: string };
 
@@ -19,47 +22,104 @@ function validate(row: any): { ok: boolean; reason?: string } {
   return { ok: true };
 }
 
-async function main() {
-  const results: Result[] = [];
-
-  console.log("\n── AAII Sentiment Scraper (Playwright) ─────────────────────────");
-
+async function runLayer(label: string, fn: (page: any) => Promise<any>, page: any, results: Result[]) {
   try {
-    const row = await scrapeAAII();
-
+    const row = await fn(page);
     if (!row) {
-      throw new Error("returned null");
+      results.push({ layer: label, ok: false, error: "returned null" });
+      return false;
     }
-
     const v = validate(row);
     if (!v.ok) {
-      throw new Error(`validation failed: ${v.reason}`);
+      results.push({ layer: label, ok: false, error: v.reason });
+      return false;
+    }
+    results.push({ layer: label, ok: true, data: row });
+    return true;
+  } catch (e: any) {
+    results.push({ layer: label, ok: false, error: e.message });
+    return false;
+  }
+}
+
+async function main() {
+  const results: Result[] = [];
+  let browser = null;
+
+  console.log("\n═══ AAII Sentiment Scraper - 3 Layers ═══\n");
+
+  try {
+    // Launch browser once
+    console.log("Launching browser...");
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    });
+
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    });
+
+    const page = await context.newPage();
+
+    console.log("Navigating to AAII...\n");
+    await page.goto(AAII_URL, { waitUntil: "networkidle", timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // ── Layer 1: DOM Table ──
+    console.log("── Layer 1: DOM Table Extraction ─────────────────");
+    const l1 = await runLayer("Layer 1 (DOM table)", layer1DOMTable, page, results);
+    if (l1) {
+      const r = results[0];
+      console.log("  ✓ PASS");
+      console.log(`  → ${r.data.reportedDate}: ${r.data.bullish}% / ${r.data.neutral}% / ${r.data.bearish}%`);
+    } else {
+      console.log(`  ✗ FAIL: ${results[0].error}`);
     }
 
-    console.log("✓ PASS");
-    console.log("  → reportedDate:", row.reportedDate);
-    console.log("  → bullish:", row.bullish + "%");
-    console.log("  → neutral:", row.neutral + "%");
-    console.log("  → bearish:", row.bearish + "%");
-    console.log("  → source:", row.source);
+    // ── Layer 2: Text/Regex ──
+    console.log("\n── Layer 2: Text/Regex Pattern Search ───────────");
+    const l2 = await runLayer("Layer 2 (text/regex)", layer2TextRegex, page, results);
+    if (l2) {
+      const r = results[1];
+      console.log("  ✓ PASS");
+      console.log(`  → ${r.data.reportedDate}: ${r.data.bullish}% / ${r.data.neutral}% / ${r.data.bearish}%`);
+    } else {
+      console.log(`  ✗ FAIL: ${results[1].error}`);
+    }
 
-    results.push({ layer: "Scraper", ok: true, data: row });
+    // ── Layer 3: Alternative ──
+    console.log("\n── Layer 3: Alternative Approaches ──────────────");
+    const l3 = await runLayer("Layer 3 (alternative)", layer3Alternative, page, results);
+    if (l3) {
+      const r = results[2];
+      console.log("  ✓ PASS");
+      console.log(`  → ${r.data.reportedDate}: ${r.data.bullish}% / ${r.data.neutral}% / ${r.data.bearish}%`);
+    } else {
+      console.log(`  ✗ FAIL: ${results[2].error}`);
+    }
 
   } catch (e: any) {
-    console.log("✗ FAIL:", e.message);
-    results.push({ layer: "Scraper", ok: false, error: e.message });
+    console.error("Browser error:", e.message);
+  } finally {
+    if (browser) await browser.close();
   }
 
   // ── Summary ──
-  console.log("\n── Summary ─────────────────────────────────────────────────");
+  console.log("\n═══ Summary ═════════════════════════════════════");
+  const passed = results.filter(r => r.ok).length;
   for (const r of results) {
     const icon = r.ok ? "✓" : "✗";
     const status = r.ok ? "PASS" : `FAIL — ${r.error}`;
     console.log(`  ${icon} ${r.layer}: ${status}`);
   }
-  console.log("────────────────────────────────────────────────────────────");
+  console.log("════════════════════════════════════════════════");
 
-  if (!results[0]?.ok) {
+  if (passed === 3) {
+    console.log("\n✓ ALL 3 LAYERS PASSED!");
+  } else {
+    console.log(`\n⚠ ${passed}/3 layers passed`);
     process.exit(1);
   }
 }

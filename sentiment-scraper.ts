@@ -26,105 +26,234 @@ function validate(row: SentRow): { ok: boolean; reason?: string } {
   return { ok: true };
 }
 
-// ── Main scraping function using Playwright ───────────────────────────────────
-export async function scrapeAAII(): Promise<SentRow | null> {
-  let browser: Browser | null = null;
+// ── Shared browser setup ───────────────────────────────────────────────────────
+async function setupBrowser(): Promise<{ browser: Browser; page: Page }> {
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-blink-features=AutomationControlled"
+    ]
+  });
 
-  try {
-    console.log("Launching browser...");
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled"
-      ]
-    });
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 720 },
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  });
 
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 720 },
-      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    });
+  const page = await context.newPage();
+  return { browser, page };
+}
 
-    const page: Page = await context.newPage();
+// ── Layer 1: DOM Table Extraction ───────────────────────────────────────────
+export async function layer1DOMTable(page: Page): Promise<SentRow | null> {
+  console.log("  [Layer 1] DOM table extraction...");
 
-    console.log("Navigating to AAII...");
-    await page.goto(AAII_URL, { waitUntil: "networkidle", timeout: 30000 });
+  const tableCount = await page.locator("table").count();
+  console.log(`  [Layer 1] Tables found: ${tableCount}`);
 
-    // Wait for page to fully load
-    await page.waitForTimeout(3000);
+  if (tableCount > 0) {
+    const rows = await page.locator("table tr").all();
 
-    // Method 1: Find table directly
-    const tableCount = await page.locator("table").count();
-    console.log("Tables found:", tableCount);
+    for (const row of rows) {
+      const cells = await row.locator("td").allTextContents();
+      if (cells.length >= 4) {
+        const dateText = cells[0].trim();
+        const bullishText = cells[1].trim();
 
-    if (tableCount > 0) {
-      const rows = await page.locator("table tr").all();
+        // Skip header, look for data rows with date pattern
+        if (!/reported date/i.test(dateText) && /^[A-Z][a-z]{2}\s+\d{1,2}$/.test(dateText)) {
+          const bullish = pctToNum(bullishText);
+          const neutral = pctToNum(cells[2].trim());
+          const bearish = pctToNum(cells[3].trim());
 
-      for (const row of rows) {
-        const cells = await row.locator("td").allTextContents();
-        if (cells.length >= 4) {
-          const dateText = cells[0].trim();
-          const bullishText = cells[1].trim();
-
-          // Skip header, look for data rows with date pattern
-          if (!/reported date/i.test(dateText) && /^[A-Z][a-z]{2}\s+\d{1,2}$/.test(dateText)) {
-            const bullish = pctToNum(bullishText);
-            const neutral = pctToNum(cells[2].trim());
-            const bearish = pctToNum(cells[3].trim());
-
-            if (!isNaN(bullish) && !isNaN(neutral) && !isNaN(bearish)) {
-              const sum = bullish + neutral + bearish;
-              if (Math.abs(sum - 100) <= 1) {
-                console.log("SUCCESS! Found data:", { dateText, bullish, neutral, bearish, sum });
-                return {
-                  reportedDate: dateText,
-                  bullish,
-                  neutral,
-                  bearish,
-                  source: "aaii-playwright"
-                };
-              }
+          if (!isNaN(bullish) && !isNaN(neutral) && !isNaN(bearish)) {
+            const sum = bullish + neutral + bearish;
+            if (Math.abs(sum - 100) <= 1) {
+              console.log(`  [Layer 1] SUCCESS: ${dateText} ${bullish}/${neutral}/${bearish}`);
+              return {
+                reportedDate: dateText,
+                bullish,
+                neutral,
+                bearish,
+                source: "aaii-dom-table"
+              };
             }
           }
         }
       }
     }
+  }
 
-    // Method 2: Search in page text
-    console.log("Searching in page text...");
-    const allText = await page.textContent("body");
-    const datePattern = /([A-Z][a-z]{2}\s+\d{1,2})\s+([\d.]+%?)\s+([\d.]+%?)\s+([\d.]+%?)/g;
+  console.log("  [Layer 1] No valid data found in DOM table");
+  return null;
+}
+
+// ── Layer 2: Text/Regex Pattern Search ──────────────────────────────────────
+export async function layer2TextRegex(page: Page): Promise<SentRow | null> {
+  console.log("  [Layer 2] Text/regex pattern search...");
+
+  // Get all page text
+  const allText = await page.textContent("body") || "";
+
+  // Look for date pattern followed by three percentages
+  const patterns = [
+    // Pattern: "Mar 25 32.1% 18.1% 49.8%"
+    /([A-Z][a-z]{2}\s+\d{1,2})\s+([\d.]+%?)\s+([\d.]+%?)\s+([\d.]+%?)/g,
+    // Pattern with "Bullish" label
+    /([A-Z][a-z]{2}\s+\d{1,2})\s+Bullish\s+([\d.]+%?)[^\d]*Neutral\s+([\d.]+%?)[^\d]*Bearish\s+([\d.]+%?)/gi,
+    // Pattern in JSON-like format
+    /"date"\s*:\s*"([A-Z][a-z]{2}\s+\d{1,2})"[^}]*"bullish"\s*:\s*([\d.]+)[^}]*"neutral"\s*:\s*([\d.]+)[^}]*"bearish"\s*:\s*([\d.]+)/gi,
+  ];
+
+  for (const pattern of patterns) {
     let match;
-
-    while ((match = datePattern.exec(allText || "")) !== null) {
+    while ((match = pattern.exec(allText)) !== null) {
       const [_, date, bull, neut, bear] = match;
       const bullish = pctToNum(bull);
       const neutral = pctToNum(neut);
       const bearish = pctToNum(bear);
       const sum = bullish + neutral + bearish;
 
+      console.log(`  [Layer 2] Found: ${date} ${bullish}/${neutral}/${bearish} (sum: ${sum.toFixed(1)})`);
+
       if (Math.abs(sum - 100) <= 1) {
-        console.log("SUCCESS (text search):", { date, bullish, neutral, bearish, sum });
+        console.log(`  [Layer 2] SUCCESS`);
         return {
-          reportedDate: date,
+          reportedDate: date.trim(),
           bullish,
           neutral,
           bearish,
-          source: "aaii-playwright"
+          source: "aaii-text-regex"
         };
       }
     }
+  }
 
-    // Method 3: Retry with reload
-    console.log("Retrying...");
+  // Try extracting from any element with data attributes
+  const dataElements = await page.locator("[data-bullish], [data-bearish], [class*='sentiment']").all();
+  for (const el of dataElements) {
+    const text = await el.textContent();
+    const match = /([A-Z][a-z]{2}\s+\d{1,2})\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/.exec(text || "");
+    if (match) {
+      const [_, date, bull, neut, bear] = match;
+      const bullish = parseFloat(bull);
+      const neutral = parseFloat(neut);
+      const bearish = parseFloat(bear);
+      const sum = bullish + neutral + bearish;
+
+      if (Math.abs(sum - 100) <= 1) {
+        console.log(`  [Layer 2] SUCCESS (data attr)`);
+        return { reportedDate: date, bullish, neutral, bearish, source: "aaii-text-regex" };
+      }
+    }
+  }
+
+  console.log("  [Layer 2] No valid data found via text/regex");
+  return null;
+}
+
+// ── Layer 3: Alternative Approaches ─────────────────────────────────────────
+export async function layer3Alternative(page: Page): Promise<SentRow | null> {
+  console.log("  [Layer 3] Alternative approaches...");
+
+  // Method 3a: Try to get innerHTML for regex extraction
+  console.log("  [Layer 3] Trying innerHTML regex...");
+  try {
+    const html = await page.content();
+    const match = /([A-Z][a-z]{2}\s+\d{1,2})\s+([\d.]+%?)\s+([\d.]+%?)\s+([\d.]+%?)/.exec(html);
+    if (match) {
+      const [_, date, bull, neut, bear] = match;
+      const bullish = pctToNum(bull);
+      const neutral = pctToNum(neut);
+      const bearish = pctToNum(bear);
+      const sum = bullish + neutral + bearish;
+      if (Math.abs(sum - 100) <= 1) {
+        console.log(`  [Layer 3] SUCCESS (innerHTML)`);
+        return { reportedDate: date, bullish, neutral, bearish, source: "aaii-innerhtml" };
+      }
+    }
+  } catch { /* ignore */ }
+
+  // Method 3b: Try JavaScript evaluation
+  console.log("  [Layer 3] Trying JS evaluation...");
+  try {
+    const jsResult = await page.evaluate(() => {
+      // Look for JSON data in script tags
+      const scripts = document.querySelectorAll("script:not([src])");
+      for (const script of scripts) {
+        const content = script.textContent || "";
+        if (content.includes("bullish") || content.includes("Bearish")) {
+          const match = /"date"\s*:\s*"([^"]+)"[^}]*"bullish"\s*:\s*([\d.]+)[^}]*"neutral"\s*:\s*([\d.]+)[^}]*"bearish"\s*:\s*([\d.]+)/.exec(content);
+          if (match) {
+            return { date: match[1], bullish: parseFloat(match[2]), neutral: parseFloat(match[3]), bearish: parseFloat(match[4]) };
+          }
+        }
+      }
+
+      // Look for window variables
+      const win = window as any;
+      if (win.sentimentData) return win.sentimentData;
+      if (win.aaiiData) return win.aaiiData;
+
+      return null;
+    });
+
+    if (jsResult && typeof jsResult === "object") {
+      const { date, bullish, neutral, bearish } = jsResult as any;
+      if (date && bullish && neutral && bearish) {
+        const sum = bullish + neutral + bearish;
+        if (Math.abs(sum - 100) <= 1) {
+          console.log(`  [Layer 3] SUCCESS (JS eval)`);
+          return { reportedDate: date, bullish, neutral, bearish, source: "aaii-js-eval" };
+        }
+      }
+    }
+  } catch (e) {
+    console.log(`  [Layer 3] JS eval failed: ${e}`);
+  }
+
+  // Method 3c: Try mobile viewport
+  console.log("  [Layer 3] Trying mobile viewport...");
+  try {
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.waitForTimeout(2000);
+
+    // Re-check tables with mobile view
+    const mobileTableCount = await page.locator("table").count();
+    if (mobileTableCount > 0) {
+      const rows = await page.locator("table tr").all();
+      for (const row of rows) {
+        const cells = await row.locator("td").allTextContents();
+        if (cells.length >= 4) {
+          const dateText = cells[0].trim();
+          if (!/reported date/i.test(dateText) && /^[A-Z][a-z]{2}\s+\d{1,2}$/.test(dateText)) {
+            const bullish = pctToNum(cells[1].trim());
+            const neutral = pctToNum(cells[2].trim());
+            const bearish = pctToNum(cells[3].trim());
+            if (Math.abs(bullish + neutral + bearish - 100) <= 1) {
+              console.log(`  [Layer 3] SUCCESS (mobile)`);
+              return { reportedDate: dateText, bullish, neutral, bearish, source: "aaii-mobile" };
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.log(`  [Layer 3] Mobile failed: ${e}`);
+  }
+
+  // Method 3d: Reload and retry
+  console.log("  [Layer 3] Reloading page...");
+  try {
     await page.reload({ waitUntil: "networkidle" });
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(3000);
 
-    // Try table again
-    const rowsRetry = await page.locator("table tr").all();
-    for (const row of rowsRetry) {
+    // Try DOM table again after reload
+    const rows = await page.locator("table tr").all();
+    for (const row of rows) {
       const cells = await row.locator("td").allTextContents();
       if (cells.length >= 4) {
         const dateText = cells[0].trim();
@@ -132,21 +261,45 @@ export async function scrapeAAII(): Promise<SentRow | null> {
           const bullish = pctToNum(cells[1].trim());
           const neutral = pctToNum(cells[2].trim());
           const bearish = pctToNum(cells[3].trim());
-          const sum = bullish + neutral + bearish;
-
-          if (Math.abs(sum - 100) <= 1) {
-            console.log("SUCCESS (retry):", { dateText, bullish, neutral, bearish, sum });
-            return {
-              reportedDate: dateText,
-              bullish,
-              neutral,
-              bearish,
-              source: "aaii-playwright"
-            };
+          if (Math.abs(bullish + neutral + bearish - 100) <= 1) {
+            console.log(`  [Layer 3] SUCCESS (reload)`);
+            return { reportedDate: dateText, bullish, neutral, bearish, source: "aaii-reload" };
           }
         }
       }
     }
+  } catch (e) {
+    console.log(`  [Layer 3] Reload failed: ${e}`);
+  }
+
+  console.log("  [Layer 3] No valid data found via alternatives");
+  return null;
+}
+
+// ── Main scraping function (runs all 3 layers) ────────────────────────────────
+export async function scrapeAAII(): Promise<SentRow | null> {
+  let browser: Browser | null = null;
+
+  try {
+    console.log("Launching browser...");
+    const { browser: b, page } = await setupBrowser();
+    browser = b;
+
+    console.log("Navigating to AAII...");
+    await page.goto(AAII_URL, { waitUntil: "networkidle", timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // ── Layer 1: DOM Table ──
+    let result = await layer1DOMTable(page);
+    if (result) return result;
+
+    // ── Layer 2: Text/Regex ──
+    result = await layer2TextRegex(page);
+    if (result) return result;
+
+    // ── Layer 3: Alternative ──
+    result = await layer3Alternative(page);
+    if (result) return result;
 
     // Save debug info
     try {
