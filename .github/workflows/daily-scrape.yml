@@ -38,7 +38,7 @@ jobs:
       - run: npm ci
 
       - name: Install Playwright browsers
-        run: npx playwright install
+        run: npx playwright install --with-deps chromium
 
       - name: Test all extraction layers
         run: npx ts-node test-layers.ts
