@@ -107,9 +107,15 @@ async function runTests() {
             console.log("═══════════════════════════════════════════════════");
 
             browser = await chromium.launch({ headless: true });
-            const page = await browser.newPage();
+            const context = await browser.newContext({
+                viewport: { width: 1280, height: 720 },
+                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+            });
+            const page = await context.newPage();
             await page.goto(AAII_URL, { waitUntil: "networkidle", timeout: 30000 });
-            await page.waitForTimeout(2000);
+            // Wait for table to be visible
+            await page.waitForSelector("table", { timeout: 10000 });
+            await page.waitForTimeout(3000);
 
             const result = await testLayer("Layer 4 (Vision LLM) - Standalone", layer4VisionLLM, page);
             results.push(result);
