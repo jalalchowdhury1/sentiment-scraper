@@ -16,4 +16,18 @@ jobs:
           node-version: '20'
       - run: npm install
       - run: npx playwright install chromium
-      - run: npx ts-node quick-test.ts
+      - run: npx ts-node test-layers.ts
+
+  scrape:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npx playwright install chromium
+      - run: npx ts-node sentiment-scraper.ts
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
