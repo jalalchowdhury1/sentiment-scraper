@@ -7,8 +7,11 @@
  */
 import "dotenv/config";
 import { chromium } from "playwright";
+import { exec } from "child_process";
+import { promisify } from "util";
 import { layer1DOMTable, layer2TextRegex, layer3Alternative } from "./sentiment-scraper";
 
+const execAsync = promisify(exec);
 const AAII_URL = "https://www.aaii.com/sentimentsurvey/sent_results";
 
 type Result = { layer: string; ok: boolean; data?: any; error?: string };
@@ -43,6 +46,14 @@ async function runLayer(label: string, fn: (page: any) => Promise<any>, page: an
 }
 
 async function main() {
+  // Install Playwright browsers if not present
+  console.log("Installing Playwright browsers...");
+  try {
+    await execAsync("npx playwright install chromium");
+  } catch (e) {
+    // Browser may already be installed
+  }
+
   const results: Result[] = [];
   let browser = null;
 
