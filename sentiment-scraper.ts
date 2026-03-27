@@ -38,7 +38,10 @@ async function extractFromDom(page: Page): Promise<SentRow | null> {
   // Wait until the correct table is present (contains the header text)
   await page.waitForFunction(() => {
     const tables = Array.from(document.querySelectorAll("table"));
-    return tables.some(t => /Reported Date/i.test(t.innerText) && /Bullish/i.test(t.innerText));
+    return tables.some(t =>
+      (/Reported Date/i.test(t.innerText) || /Week Ending/i.test(t.innerText)) &&
+      /Bullish/i.test(t.innerText)
+    );
   }, { timeout: 20000 });
 
   const row = await page.evaluate(() => {
@@ -46,7 +49,8 @@ async function extractFromDom(page: Page): Promise<SentRow | null> {
     const tables = Array.from(document.querySelectorAll("table"));
     const target = tables.find(t => {
       const txt = t.innerText;
-      return /Reported Date/i.test(txt) && /Bullish/i.test(txt) && /Bearish/i.test(txt);
+      return (/Reported Date/i.test(txt) || /Week Ending/i.test(txt)) &&
+             /Bullish/i.test(txt) && /Bearish/i.test(txt);
     });
     if (!target) return null;
 
@@ -59,7 +63,7 @@ async function extractFromDom(page: Page): Promise<SentRow | null> {
       if (tds.length >= 4 && tds.every(td => td.textContent && td.textContent.trim().length > 0)) {
         // Skip header row containing "Reported Date"
         const joined = tds.map(td => td.textContent!.trim()).join("|");
-        if (!/Reported Date/i.test(joined)) {
+        if (!/Reported Date/i.test(joined) && !/Week Ending/i.test(joined)) {
           dataRow = tr as HTMLTableRowElement;
           break;
         }
@@ -89,9 +93,9 @@ async function extractWithRegex(page: Page): Promise<SentRow | null> {
   // Use full HTML so we can match across tags/newlines
   const html = await page.content();
 
-  // Match the first occurrence of "Mon DD" (optional year) followed by three percentages.
+  // Match the first occurrence of a date (Mon DD or MM/DD/YYYY) followed by three percentages.
   // Use [\s\S]*? to cross tags.
-  const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)[\s\S]*?([\d.]+)%[\s\S]*?([\d.]+)%[\s\S]*?([\d.]+)%/;
+  const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?|\d{1,2}\/\d{1,2}\/\d{4})[\s\S]*?([\d.]+)%[\s\S]*?([\d.]+)%[\s\S]*?([\d.]+)%/;
   const m = html.match(rx);
   if (!m) return null;
 
