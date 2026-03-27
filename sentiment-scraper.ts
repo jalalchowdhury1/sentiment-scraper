@@ -34,55 +34,120 @@ function validate(row: SentRow): { ok: boolean; reason?: string } {
   return { ok: true };
 }
 
-// ── Layer 1: Direct HTTP + cheerio (no browser needed) ───────────────────────
+// ── Layer 1: Direct HTTP + cheerio (with Internet Archive fallback) ─────────
 export async function layer1Direct(): Promise<SentRow | null> {
+  // First try AAII directly
   const res = await fetch(AAII_URL, {
     headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, deflate, br",
+      "DNT": "1",
+      "Connection": "keep-alive",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
+      "Cache-Control": "max-age=0",
     },
   });
 
   if (!res.ok) {
-    console.warn(`Layer 1: HTTP ${res.status}`);
-    return null;
+    console.warn(`Layer 1: AAII direct failed (${res.status}), trying Internet Archive...`);
+  } else {
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    // Check if AAII blocked us with bot protection
+    const bodyText = $("body").text();
+    if (!/Reported Date/i.test(bodyText) || /Pardon Our Interruption/i.test(bodyText)) {
+      console.warn("Layer 1: AAII returned bot protection page, trying Internet Archive...");
+    } else {
+      let result: SentRow | null = null;
+      $("table").each((_, table) => {
+        if (result) return false;
+        const tableText = $(table).text();
+        if (!/Reported Date/i.test(tableText) || !/Bullish/i.test(tableText))
+          return;
+
+        $(table)
+          .find("tr")
+          .each((_, tr) => {
+            if (result) return false;
+            const tds = $(tr).find("td");
+            if (tds.length < 4) return;
+            const cells = tds.map((_, td) => $(td).text().trim()).get();
+            if (!cells.every((c: string) => c.length > 0)) return;
+            if (/Reported Date/i.test(cells.join("|"))) return;
+
+            const candidate: SentRow = {
+              reportedDate: cells[0],
+              bullish: pctToNum(cells[1]),
+              neutral: pctToNum(cells[2]),
+              bearish: pctToNum(cells[3]),
+              source: "aaii-direct",
+            };
+            if (validate(candidate).ok) result = candidate;
+          });
+      });
+      if (result) return result;
+    }
   }
 
-  const html = await res.text();
-  const $ = cheerio.load(html);
-  let result: SentRow | null = null;
+  // Fallback: Try Internet Archive/Wayback Machine (may return historical data)
+  try {
+    console.warn("Layer 1: Trying Internet Archive...");
+    const archiveUrl = "https://web.archive.org/web/2024/" + AAII_URL;
+    const archiveRes = await fetch(archiveUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+      }
+    });
 
-  $("table").each((_, table) => {
-    if (result) return false;
-    const tableText = $(table).text();
-    if (!/Reported Date/i.test(tableText) || !/Bullish/i.test(tableText))
-      return;
+    if (archiveRes.ok) {
+      const html = await archiveRes.text();
+      const $ = cheerio.load(html);
+      let result: SentRow | null = null;
 
-    $(table)
-      .find("tr")
-      .each((_, tr) => {
+      $("table").each((_, table) => {
         if (result) return false;
-        const tds = $(tr).find("td");
-        if (tds.length < 4) return;
-        const cells = tds.map((_, td) => $(td).text().trim()).get();
-        if (!cells.every((c: string) => c.length > 0)) return;
-        if (/Reported Date/i.test(cells.join("|"))) return; // skip header
+        const tableText = $(table).text();
+        if (!/Reported Date/i.test(tableText) || !/Bullish/i.test(tableText))
+          return;
 
-        const candidate: SentRow = {
-          reportedDate: cells[0],
-          bullish: pctToNum(cells[1]),
-          neutral: pctToNum(cells[2]),
-          bearish: pctToNum(cells[3]),
-          source: "aaii-direct",
-        };
-        if (validate(candidate).ok) result = candidate;
+        $(table)
+          .find("tr")
+          .each((_, tr) => {
+            if (result) return false;
+            const tds = $(tr).find("td");
+            if (tds.length < 4) return;
+            const cells = tds.map((_, td) => $(td).text().trim()).get();
+            if (!cells.every((c: string) => c.length > 0)) return;
+            if (/Reported Date/i.test(cells.join("|"))) return;
+
+            const candidate: SentRow = {
+              reportedDate: cells[0],
+              bullish: pctToNum(cells[1]),
+              neutral: pctToNum(cells[2]),
+              bearish: pctToNum(cells[3]),
+              source: "aaii-archive",
+            };
+            if (validate(candidate).ok) result = candidate;
+          });
       });
-  });
 
-  return result;
+      if (result) {
+        console.warn("Layer 1: Got data from Internet Archive (historical data)");
+        return result;
+      }
+    }
+  } catch (e) {
+    console.warn("Layer 1 Archive fallback failed:", (e as Error).message);
+  }
+
+  return null;
 }
 
 // ── Layer 2: Alternative URLs and API (completely different from Layer 1) ────
@@ -223,13 +288,9 @@ export async function layer2Alternative(page: Page): Promise<SentRow | null> {
 
 // ── Layer 3: Stagehand interaction (completely different approach) ─────────────
 export async function layer3Stagehand(stagehand: Stagehand): Promise<SentRow | null> {
-  // Use Stagehand's act() to try to interact with the page and bypass CAPTCHA
-  // This is a completely different method from DOM extraction
-
   try {
     console.warn("  Layer 3: Trying Stagehand interaction...");
 
-    // Navigate with different settings
     const page = stagehand.page!;
 
     // Try to set viewport to mobile size (often bypasses CAPTCHA)
@@ -245,17 +306,13 @@ export async function layer3Stagehand(stagehand: Stagehand): Promise<SentRow | n
       // scroll might fail, continue
     }
 
-    // Take screenshot and analyze with LLM
-    const screenshotBuf = await page.screenshot({ fullPage: true });
-
     // Try to extract data from page after interaction
     const data = await page.evaluate(() => {
       // Look for any JSON data in the page
-      const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+      const scripts = Array.from(document.querySelectorAll("script:not([src])"));
       for (const script of scripts) {
         const content = script.textContent || "";
         if (content.includes("bullish") || content.includes("Bearish")) {
-          // Try to extract numbers
           const match = content.match(/"Bullish"\s*:\s*([\d.]+)/);
           if (match) {
             return { found: true, type: "script" };
@@ -264,7 +321,7 @@ export async function layer3Stagehand(stagehand: Stagehand): Promise<SentRow | n
       }
 
       // Try to find data in any attribute
-      const allElements = document.querySelectorAll('*');
+      const allElements = document.querySelectorAll("*");
       for (const el of allElements) {
         const attrs = Array.from(el.attributes).map(a => a.value);
         const text = attrs.join(" ");
@@ -280,7 +337,6 @@ export async function layer3Stagehand(stagehand: Stagehand): Promise<SentRow | n
     });
 
     if (data && data.found) {
-      // Try to parse the data we found
       const content = await page.content();
       const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s+([\d.]+)%?\s+([\d.]+)%?\s+([\d.]+)%?/;
       const m = content.match(rx);
@@ -447,10 +503,10 @@ async function runWorkflow() {
       // Save debug artifacts before giving up
       try {
         await page.screenshot({ path: "aaii-fail.png", fullPage: true });
-      } catch { }
+      } catch { /* ignore */ }
       try {
         await fs.writeFile("aaii-fail.html", await page.content());
-      } catch { }
+      } catch { /* ignore */ }
       throw lastErr ?? new Error("All extraction layers failed");
     }
 
