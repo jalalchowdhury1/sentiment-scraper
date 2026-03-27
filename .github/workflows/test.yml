@@ -16,4 +16,4 @@ jobs:
           node-version: '20'
       - run: npm install
       - run: npx playwright install chromium
-      - run: npx ts-node quick-test.ts
+      - run: npx ts-node sentiment-scraper.ts
