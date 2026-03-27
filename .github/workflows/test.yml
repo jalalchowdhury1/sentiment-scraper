@@ -13,9 +13,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
       - run: npm ci
-      - run: npx playwright install
+      - run: node node_modules/playwright/cli.js install --with-deps chromium
       - run: npx ts-node test-layers.ts
 
   scrape:
@@ -25,9 +25,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
       - run: npm ci
-      - run: npx playwright install
+      - run: node node_modules/playwright/cli.js install --with-deps chromium
       - run: npx ts-node sentiment-scraper.ts
         env:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
