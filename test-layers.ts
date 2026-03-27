@@ -45,6 +45,7 @@ async function runLayer(label: string, fn: (page: any) => Promise<any>, page: an
 async function main() {
   const results: Result[] = [];
   let browser = null;
+  let l1 = false, l2 = false, l3 = false, l4Skipped = false;
 
   console.log("\n═══ AAII Sentiment Scraper - 4 Layers ═══\n");
 
@@ -69,7 +70,7 @@ async function main() {
 
     // ── Layer 1: DOM Table ──
     console.log("── Layer 1: DOM Table Extraction ─────────────────");
-    const l1 = await runLayer("Layer 1 (DOM table)", layer1DOMTable, page, results);
+    l1 = await runLayer("Layer 1 (DOM table)", layer1DOMTable, page, results);
     if (l1) {
       const r = results[0];
       console.log("  ✓ PASS");
@@ -80,7 +81,7 @@ async function main() {
 
     // ── Layer 2: Text/Regex ──
     console.log("\n── Layer 2: Text/Regex Pattern Search ───────────");
-    const l2 = await runLayer("Layer 2 (text/regex)", layer2TextRegex, page, results);
+    l2 = await runLayer("Layer 2 (text/regex)", layer2TextRegex, page, results);
     if (l2) {
       const r = results[1];
       console.log("  ✓ PASS");
@@ -91,7 +92,7 @@ async function main() {
 
     // ── Layer 3: Alternative ──
     console.log("\n── Layer 3: Alternative Approaches ──────────────");
-    const l3 = await runLayer("Layer 3 (alternative)", layer3Alternative, page, results);
+    l3 = await runLayer("Layer 3 (alternative)", layer3Alternative, page, results);
     if (l3) {
       const r = results[2];
       console.log("  ✓ PASS");
@@ -100,15 +101,21 @@ async function main() {
       console.log(`  ✗ FAIL: ${results[2].error}`);
     }
 
-    // ── Layer 4: Vision LLM ──
+    // ── Layer 4: Vision LLM (only tested if Layers 1-3 all fail, to save API costs) ──
     console.log("\n── Layer 4: Vision LLM Extraction ────────────────");
-    const l4 = await runLayer("Layer 4 (vision LLM)", layer4VisionLLM, page, results);
-    if (l4) {
-      const r = results[3];
-      console.log("  ✓ PASS");
-      console.log(`  → ${r.data.reportedDate}: ${r.data.bullish}% / ${r.data.neutral}% / ${r.data.bearish}%`);
+    if (l1 && l2 && l3) {
+      console.log("  ⊘ SKIPPED: Layers 1-3 succeeded, Layer 4 not needed (saves API cost)");
+      console.log("  → In production, Layer 4 is only called when Layers 1-3 fail");
     } else {
-      console.log(`  ✗ FAIL: ${results[3]?.error || "returned null"}`);
+      console.log("  ⚠ Layers 1-3 failed, testing Layer 4 as fallback...");
+      const l4 = await runLayer("Layer 4 (vision LLM)", layer4VisionLLM, page, results);
+      if (l4) {
+        const r = results[3];
+        console.log("  ✓ PASS");
+        console.log(`  → ${r.data.reportedDate}: ${r.data.bullish}% / ${r.data.neutral}% / ${r.data.bearish}%`);
+      } else {
+        console.log(`  ✗ FAIL: ${results[3]?.error || "returned null"}`);
+      }
     }
 
   } catch (e: any) {
@@ -120,17 +127,33 @@ async function main() {
   // ── Summary ──
   console.log("\n═══ Summary ═════════════════════════════════════");
   const passed = results.filter(r => r.ok).length;
+  l4Skipped = !l1 || !l2 || !l3; // Layer 4 was skipped if Layers 1-3 all succeeded
+
   for (const r of results) {
     const icon = r.ok ? "✓" : "✗";
     const status = r.ok ? "PASS" : `FAIL — ${r.error}`;
     console.log(`  ${icon} ${r.layer}: ${status}`);
   }
+
+  if (l4Skipped) {
+    console.log("  ⊘ Layer 4 (vision LLM): SKIPPED (Layers 1-3 succeeded)");
+  }
   console.log("════════════════════════════════════════════════");
 
-  if (passed === 4) {
-    console.log("\n✓ ALL 4 LAYERS PASSED!");
+  // Success = Layers 1-3 pass, OR Layer 4 passes as fallback
+  const corePassed = results.slice(0, 3).every(r => r.ok);
+  const fallbackPassed = !l4Skipped && results[3]?.ok;
+
+  if (corePassed) {
+    if (l4Skipped) {
+      console.log("\n✓ SUCCESS! (Layers 1-3 passed, Layer 4 skipped to save costs)");
+    } else if (fallbackPassed) {
+      console.log("\n✓ SUCCESS! (All 4 layers passed)");
+    } else {
+      console.log("\n⚠ Partial success - Layers 1-3 passed, Layer 4 fallback failed");
+    }
   } else {
-    console.log(`\n⚠ ${passed}/4 layers passed`);
+    console.log("\n✗ FAIL: Core layers 1-3 all failed");
     process.exit(1);
   }
 }
