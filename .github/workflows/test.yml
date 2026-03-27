@@ -14,8 +14,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm install
-      - run: npx playwright install chromium
+      - run: npm ci
+      - run: npx playwright install
       - run: npx ts-node test-layers.ts
 
   scrape:
@@ -26,8 +26,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm install
-      - run: npx playwright install chromium
+      - run: npm ci
+      - run: npx playwright install
       - run: npx ts-node sentiment-scraper.ts
         env:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
