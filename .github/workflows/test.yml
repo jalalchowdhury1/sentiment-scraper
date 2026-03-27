@@ -17,6 +17,8 @@ jobs:
       - run: npm ci
       - run: node node_modules/playwright/cli.js install --with-deps chromium
       - run: npx ts-node test-layers.ts
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
   scrape:
     runs-on: ubuntu-latest
