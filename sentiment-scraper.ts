@@ -13,7 +13,7 @@ type SentRow = {
   bullish: number;
   neutral: number;
   bearish: number;
-  source: "aaii-direct" | "aaii-screenshot" | "aaii-dom" | "aaii-regex";
+  source: "aaii-direct" | "aaii-screenshot" | "aaii-dom" | "aaii-regex" | "aaii-jsonld" | "aaii-html-regex" | "aaii-innerhtml-regex" | "aaii-meta";
 };
 
 function pctToNum(txt: string): number {
@@ -116,65 +116,190 @@ Reply with ONLY valid JSON, no markdown, no explanation:
   };
 }
 
-// ── Layer 3: Browser (DOM then regex, no blocking wait) ──────────────────────
+// ── Layer 3: Retry + wait strategy with multiple data extraction methods ─────
 export async function layer3Browser(page: Page): Promise<SentRow | null> {
-  // 3a: DOM table extraction — no waitForFunction, evaluate directly
-  try {
-    const row = await page.evaluate(() => {
-      const tables = Array.from(document.querySelectorAll("table"));
-      const target = tables.find((t) => {
-        const txt = t.textContent ?? "";
-        return /Reported Date/i.test(txt) && /Bullish/i.test(txt) && /Bearish/i.test(txt);
+  const maxRetries = 3;
+  const baseDelay = 5000; // 5 seconds
+
+  // Helper: Try multiple extraction methods
+  async function tryExtraction(page: Page): Promise<SentRow | null> {
+    // Method 3a: DOM table extraction with waitForSelector
+    try {
+      const row = await page.evaluate(() => {
+        const tables = Array.from(document.querySelectorAll("table"));
+        const target = tables.find((t) => {
+          const txt = t.textContent ?? "";
+          return /Reported Date/i.test(txt) && /Bullish/i.test(txt) && /Bearish/i.test(txt);
+        });
+        if (!target) return null;
+
+        for (const tr of Array.from(target.querySelectorAll("tr"))) {
+          const tds = Array.from(tr.querySelectorAll("td"));
+          if (tds.length < 4) continue;
+          const cells = tds.map((td) => td.textContent?.trim() ?? "");
+          if (!cells.every((c) => c.length > 0)) continue;
+          if (/Reported Date/i.test(cells.join("|"))) continue;
+          return { date: cells[0], bull: cells[1], neu: cells[2], bear: cells[3] };
+        }
+        return null;
       });
-      if (!target) return null;
 
-      for (const tr of Array.from(target.querySelectorAll("tr"))) {
-        const tds = Array.from(tr.querySelectorAll("td"));
-        if (tds.length < 4) continue;
-        const cells = tds.map((td) => td.textContent?.trim() ?? "");
-        if (!cells.every((c) => c.length > 0)) continue;
-        if (/Reported Date/i.test(cells.join("|"))) continue;
-        return { date: cells[0], bull: cells[1], neu: cells[2], bear: cells[3] };
+      if (row) {
+        return {
+          reportedDate: row.date,
+          bullish: pctToNum(row.bull),
+          neutral: pctToNum(row.neu),
+          bearish: pctToNum(row.bear),
+          source: "aaii-dom",
+        };
       }
-      return null;
-    });
-
-    if (row) {
-      return {
-        reportedDate: row.date,
-        bullish: pctToNum(row.bull),
-        neutral: pctToNum(row.neu),
-        bearish: pctToNum(row.bear),
-        source: "aaii-dom",
-      };
+    } catch (e) {
+      console.warn("  Layer 3 DOM extraction failed:", (e as Error).message);
     }
-    console.warn("  Layer 3 DOM: no matching table found");
-  } catch (e) {
-    console.warn("  Layer 3 DOM failed:", (e as Error).message);
+
+    // Method 3b: Try to find data in JSON-LD structured data
+    try {
+      const jsonLd = await page.evaluate(() => {
+        const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+        for (const script of scripts) {
+          try {
+            const data = JSON.parse(script.textContent || "");
+            return JSON.stringify(data);
+          } catch { }
+        }
+        return null;
+      });
+
+      if (jsonLd) {
+        // Look for sentiment data in JSON-LD
+        const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)%/;
+        const m = jsonLd.match(rx);
+        if (m) {
+          return {
+            reportedDate: m[1].trim(),
+            bullish: parseFloat(m[2]),
+            neutral: parseFloat(m[3]),
+            bearish: parseFloat(m[4]),
+            source: "aaii-jsonld",
+          };
+        }
+      }
+    } catch (e) {
+      console.warn("  Layer 3 JSON-LD extraction failed:", (e as Error).message);
+    }
+
+    // Method 3c: Regex on full HTML source (not just innerText)
+    try {
+      const html = await page.content();
+      const datePattern = "([A-Z][a-z]{2}\\s+\\d{1,2}(?:,\\s*\\d{4})?)";
+      const pctPattern = "([\\d.]+)%";
+      const htmlRx = new RegExp(datePattern + "\\s*<.*?>" + ".*?" + pctPattern + ".*?" + pctPattern + ".*?" + pctPattern, "s");
+      const m = html.match(htmlRx);
+      if (m) {
+        return {
+          reportedDate: m[1].trim(),
+          bullish: parseFloat(m[2]),
+          neutral: parseFloat(m[3]),
+          bearish: parseFloat(m[4]),
+          source: "aaii-html-regex",
+        };
+      }
+    } catch (e) {
+      console.warn("  Layer 3 HTML regex extraction failed:", (e as Error).message);
+    }
+
+    // Method 3d: Regex on innerHTML (includes hidden elements)
+    try {
+      const innerHtml: string = await page.evaluate(() => document.body.innerHTML);
+      const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s*<\/td>.*?([\d.]+)%.*?([\d.]+)%.*?([\d.]+)%/s;
+      const m = innerHtml.match(rx);
+      if (m) {
+        return {
+          reportedDate: m[1].trim(),
+          bullish: parseFloat(m[2]),
+          neutral: parseFloat(m[3]),
+          bearish: parseFloat(m[4]),
+          source: "aaii-innerhtml-regex",
+        };
+      }
+    } catch (e) {
+      console.warn("  Layer 3 innerHTML regex extraction failed:", (e as Error).message);
+    }
+
+    // Method 3e: Look for data in meta tags or hidden elements
+    try {
+      const metaData = await page.evaluate(() => {
+        // Check meta tags
+        const metas = Array.from(document.querySelectorAll('meta[name*="sentiment"], meta[property*="sentiment"]'));
+        if (metas.length > 0) {
+          return metas.map(m => m.getAttribute('content') || '').join('|');
+        }
+
+        // Check data attributes
+        const dataElements = document.querySelectorAll('[data-sentiment], [data-bullish], [data-bearish]');
+        if (dataElements.length > 0) {
+          const el = dataElements[0] as HTMLElement;
+          return `${el.dataset.sentiment || ''}|${el.dataset.bullish || ''}|${el.dataset.neutral || ''}|${el.dataset.bearish || ''}`;
+        }
+
+        // Check hidden divs that might contain data
+        const hiddenDivs = document.querySelectorAll('div[style*="display: none"], div[style*="visibility: hidden"]');
+        for (const div of hiddenDivs) {
+          const text = div.textContent || "";
+          if (/[A-Z][a-z]{2}\s+\d{1,2}/.test(text) && /%/.test(text)) {
+            return text;
+          }
+        }
+
+        return null;
+      });
+
+      if (metaData) {
+        const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s+([\d.]+)%?\s+([\d.]+)%?\s+([\d.]+)%?/;
+        const m = metaData.match(rx);
+        if (m) {
+          return {
+            reportedDate: m[1].trim(),
+            bullish: parseFloat(m[2]),
+            neutral: parseFloat(m[3]),
+            bearish: parseFloat(m[4]),
+            source: "aaii-meta",
+          };
+        }
+      }
+    } catch (e) {
+      console.warn("  Layer 3 meta/hidden extraction failed:", (e as Error).message);
+    }
+
+    return null;
   }
 
-  // 3b: regex on rendered innerText
-  try {
-    const text: string = await page.evaluate(() => document.body.innerText);
-    // Log first 300 chars so we can diagnose what the browser is seeing
-    console.warn("  Layer 3 page text preview:", text.substring(0, 300).replace(/\n+/g, " "));
+  // Try with exponential backoff
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    console.warn(`  Layer 3 attempt ${attempt}/${maxRetries}: trying extraction...`);
 
-    const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)%/;
-    const m = text.match(rx);
-    if (m) {
-      return {
-        reportedDate: m[1].trim(),
-        bullish: parseFloat(m[2]),
-        neutral: parseFloat(m[3]),
-        bearish: parseFloat(m[4]),
-        source: "aaii-regex",
-      };
+    const result = await tryExtraction(page);
+    if (result) {
+      console.warn(`  Layer 3: data found on attempt ${attempt}`);
+      return result;
     }
-    console.warn("  Layer 3 regex: no date+percentage pattern found in rendered text");
-  } catch (e) {
-    console.warn("  Layer 3 regex failed:", (e as Error).message);
+
+    if (attempt < maxRetries) {
+      const delay = baseDelay * Math.pow(2, attempt - 1); // Exponential backoff
+      console.warn(`  Layer 3: no data found, waiting ${delay}ms before retry...`);
+      await new Promise(r => setTimeout(r, delay));
+
+      // Try refreshing the page
+      try {
+        await page.reload({ waitUntil: "networkidle" });
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (e) {
+        console.warn(`  Layer 3: page reload failed:`, (e as Error).message);
+      }
+    }
   }
 
+  console.warn("  Layer 3: all extraction methods and retries exhausted");
   return null;
 }
 
@@ -302,10 +427,10 @@ async function runWorkflow() {
       // Save debug artifacts before giving up
       try {
         await page.screenshot({ path: "aaii-fail.png", fullPage: true });
-      } catch {}
+      } catch { }
       try {
         await fs.writeFile("aaii-fail.html", await page.content());
-      } catch {}
+      } catch { }
       throw lastErr ?? new Error("All extraction layers failed");
     }
 
