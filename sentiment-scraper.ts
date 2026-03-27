@@ -1,84 +1,160 @@
-// Generated script for workflow 5293e128-e6cf-426b-b166-a9b52011b832
-// Generated at 2025-06-17T18:35:07.961Z
-
 import "dotenv/config";
 import { Stagehand, type ConstructorParams } from "@browserbasehq/stagehand";
-import { google } from "googleapis";              // ← Google Sheets client
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { google } from "googleapis";
 import fs from "node:fs/promises";
+import * as cheerio from "cheerio";
 import type { Page } from "@browserbasehq/stagehand";
+
+const AAII_URL = "https://www.aaii.com/sentimentsurvey/sent_results";
 
 type SentRow = {
   reportedDate: string;
   bullish: number;
   neutral: number;
   bearish: number;
-  source: "aaii-dom" | "aaii-regex";
+  source: "aaii-direct" | "aaii-screenshot" | "aaii-dom" | "aaii-regex";
 };
 
 function pctToNum(txt: string): number {
   return parseFloat(txt.replace(/[%\s,]/g, ""));
 }
 
-function within(v: number, lo: number, hi: number) {
-  return v >= lo && v <= hi;
-}
-
 function validate(row: SentRow): { ok: boolean; reason?: string } {
   const sum = row.bullish + row.neutral + row.bearish;
-  if (!within(row.bullish, 0, 100) || !within(row.neutral, 0, 100) || !within(row.bearish, 0, 100)) {
-    return { ok: false, reason: "percentage out of range" };
-  }
-  if (Math.abs(sum - 100) > 0.8) {
+  if (
+    row.bullish < 0 || row.bullish > 100 ||
+    row.neutral < 0 || row.neutral > 100 ||
+    row.bearish < 0 || row.bearish > 100
+  ) return { ok: false, reason: "percentage out of range" };
+  if (Math.abs(sum - 100) > 0.8)
     return { ok: false, reason: `sum ${sum.toFixed(2)} != 100` };
-  }
   return { ok: true };
 }
 
-async function extractFromDom(page: Page): Promise<SentRow | null> {
-  // Wait until the correct table is present (contains the header text)
-  await page.waitForFunction(() => {
-    const tables = Array.from(document.querySelectorAll("table"));
-    return tables.some(t => {
-      const txt = t.textContent ?? "";
-      return /Reported Date/i.test(txt) && /Bullish/i.test(txt);
-    });
-  }, { timeout: 8000 });
+// ── Layer 1: Direct HTTP + cheerio (no browser needed) ───────────────────────
+export async function layer1Direct(): Promise<SentRow | null> {
+  const res = await fetch(AAII_URL, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+  });
+
+  if (!res.ok) {
+    console.warn(`Layer 1: HTTP ${res.status}`);
+    return null;
+  }
+
+  const html = await res.text();
+  const $ = cheerio.load(html);
+  let result: SentRow | null = null;
+
+  $("table").each((_, table) => {
+    if (result) return false;
+    const tableText = $(table).text();
+    if (!/Reported Date/i.test(tableText) || !/Bullish/i.test(tableText))
+      return;
+
+    $(table)
+      .find("tr")
+      .each((_, tr) => {
+        if (result) return false;
+        const tds = $(tr).find("td");
+        if (tds.length < 4) return;
+        const cells = tds.map((_, td) => $(td).text().trim()).get();
+        if (!cells.every((c: string) => c.length > 0)) return;
+        if (/Reported Date/i.test(cells.join("|"))) return; // skip header
+
+        const candidate: SentRow = {
+          reportedDate: cells[0],
+          bullish: pctToNum(cells[1]),
+          neutral: pctToNum(cells[2]),
+          bearish: pctToNum(cells[3]),
+          source: "aaii-direct",
+        };
+        if (validate(candidate).ok) result = candidate;
+      });
+  });
+
+  return result;
+}
+
+// ── Layer 2: Screenshot → Gemini Vision LLM ──────────────────────────────────
+export async function layer2Screenshot(page: Page): Promise<SentRow | null> {
+  const screenshotBuf = await page.screenshot({ fullPage: false });
+
+  const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY!);
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash-preview-05-20",
+  });
+
+  const imagePart = {
+    inlineData: {
+      data: Buffer.from(screenshotBuf).toString("base64"),
+      mimeType: "image/png" as const,
+    },
+  };
+
+  const prompt = `This is a screenshot of the AAII Investor Sentiment Survey historical results page.
+Find the MOST RECENT row in the data table (the first data row after the header).
+Extract the reported date and the three sentiment percentages.
+Reply with ONLY valid JSON, no markdown, no explanation:
+{"reportedDate": "Mon DD", "bullish": XX.X, "neutral": XX.X, "bearish": XX.X}`;
+
+  const result = await model.generateContent([imagePart, prompt]);
+  const text = result.response.text().trim().replace(/```json\n?|\n?```/g, "");
+  const parsed = JSON.parse(text);
+
+  return {
+    reportedDate: String(parsed.reportedDate),
+    bullish: parseFloat(parsed.bullish),
+    neutral: parseFloat(parsed.neutral),
+    bearish: parseFloat(parsed.bearish),
+    source: "aaii-screenshot",
+  };
+}
+
+// ── Layer 3a: Browser DOM extraction ─────────────────────────────────────────
+async function layer3Dom(page: Page): Promise<SentRow | null> {
+  await page.waitForFunction(
+    () => {
+      const tables = Array.from(document.querySelectorAll("table"));
+      return tables.some((t) => {
+        const txt = t.textContent ?? "";
+        return /Reported Date/i.test(txt) && /Bullish/i.test(txt);
+      });
+    },
+    { timeout: 8000 }
+  );
 
   const row = await page.evaluate(() => {
-    // Find the table that has our headers
     const tables = Array.from(document.querySelectorAll("table"));
-    const target = tables.find(t => {
+    const target = tables.find((t) => {
       const txt = t.textContent ?? "";
-      return /Reported Date/i.test(txt) && /Bullish/i.test(txt) && /Bearish/i.test(txt);
+      return (
+        /Reported Date/i.test(txt) &&
+        /Bullish/i.test(txt) &&
+        /Bearish/i.test(txt)
+      );
     });
     if (!target) return null;
 
-    // First data row: prefer rows with class "tableTxt", else first <tr> after header
-    const rows = Array.from(target.querySelectorAll("tr"));
-    // header row often bold; data rows have class="tableTxt" on <td>
-    let dataRow: HTMLTableRowElement | null = null;
-    for (const tr of rows) {
+    for (const tr of Array.from(target.querySelectorAll("tr"))) {
       const tds = Array.from(tr.querySelectorAll("td"));
-      if (tds.length >= 4 && tds.every(td => td.textContent && td.textContent.trim().length > 0)) {
-        // Skip header row containing "Reported Date"
-        const joined = tds.map(td => td.textContent!.trim()).join("|");
-        if (!/Reported Date/i.test(joined)) {
-          dataRow = tr as HTMLTableRowElement;
-          break;
-        }
-      }
+      if (tds.length < 4) continue;
+      const cells = tds.map((td) => td.textContent?.trim() ?? "");
+      if (!cells.every((c) => c.length > 0)) continue;
+      if (/Reported Date/i.test(cells.join("|"))) continue;
+      return { date: cells[0], bull: cells[1], neu: cells[2], bear: cells[3] };
     }
-    if (!dataRow) return null;
-
-    const tds = Array.from(dataRow.querySelectorAll("td")).map(td => td.textContent?.trim() ?? "");
-    // Expect: [date, bull, neutral, bear]
-    if (tds.length < 4) return null;
-
-    return { date: tds[0], bull: tds[1], neu: tds[2], bear: tds[3] };
+    return null;
   });
 
   if (!row) return null;
-
   return {
     reportedDate: row.date,
     bullish: pctToNum(row.bull),
@@ -88,15 +164,14 @@ async function extractFromDom(page: Page): Promise<SentRow | null> {
   };
 }
 
-async function extractWithRegex(page: Page): Promise<SentRow | null> {
-  // Use rendered text (innerText) so % signs are literal and HTML tags don't interfere
-  const text = await page.evaluate(() => document.body.innerText);
-
-  // Dates on this page are "Mar 25" (no year). Match date then three percentages.
-  const rx = /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)%/;
+// ── Layer 3b: Browser innerText + regex ──────────────────────────────────────
+async function layer3Regex(page: Page): Promise<SentRow | null> {
+  const text: string = await page.evaluate(() => document.body.innerText);
+  // Dates on this page are "Mar 25" or "Mar 25, 2026"
+  const rx =
+    /([A-Z][a-z]{2}\s+\d{1,2}(?:,\s*\d{4})?)\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)%/;
   const m = text.match(rx);
   if (!m) return null;
-
   return {
     reportedDate: m[1].trim(),
     bullish: parseFloat(m[2]),
@@ -106,38 +181,18 @@ async function extractWithRegex(page: Page): Promise<SentRow | null> {
   };
 }
 
-async function fetchAAII(page: Page): Promise<SentRow> {
-  await page.goto("https://www.aaii.com/sentimentsurvey/sent_results", {
-    waitUntil: "load",
-  });
-  // Give JS-rendered content time to paint
-  await new Promise(r => setTimeout(r, 3000));
-
-  // Primary: DOM table. Secondary: regex on full text.
-  const attempts = [extractFromDom, extractWithRegex];
-
-  let lastErr: Error | null = null;
-  for (let i = 0; i < attempts.length; i++) {
-    try {
-      const row = await attempts[i](page);
-      if (!row) {
-        lastErr = new Error("no match");
-      } else {
-        const v = validate(row);
-        if (v.ok) return row;
-        lastErr = new Error(`validation failed: ${v.reason}`);
-      }
-    } catch (e: any) {
-      lastErr = e instanceof Error ? e : new Error(String(e));
-    }
-    await new Promise(r => setTimeout(r, 500 * (i + 1)));
+// ── Layer 3: Browser (DOM then regex) ────────────────────────────────────────
+export async function layer3Browser(page: Page): Promise<SentRow | null> {
+  try {
+    const row = await layer3Dom(page);
+    if (row) return row;
+  } catch (e) {
+    console.warn("  Layer 3 DOM attempt failed:", (e as Error).message);
   }
-  throw lastErr ?? new Error("AAII extraction failed");
+  return layer3Regex(page);
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Stagehand configuration helper
-// ────────────────────────────────────────────────────────────────────
+// ── Stagehand config ──────────────────────────────────────────────────────────
 const stagehandConfig = (): ConstructorParams => ({
   env: "BROWSERBASE",
   verbose: 1,
@@ -145,80 +200,131 @@ const stagehandConfig = (): ConstructorParams => ({
   modelClientOptions: { apiKey: process.env.GOOGLE_API_KEY },
 });
 
-// ────────────────────────────────────────────────────────────────────
-// Main workflow
-// ────────────────────────────────────────────────────────────────────
-async function runWorkflow() {
-  let stagehand: Stagehand | null = null;
+// ── Write results to Google Sheets ────────────────────────────────────────────
+async function writeToSheets(row: SentRow): Promise<void> {
+  const SHEET_ID =
+    process.env.SHEET_ID ?? "1zQQ2am1yhzTwY7nx8xPak4Q0WoNMwxWj7Ekr-fDEIF4";
+  const auth = new google.auth.GoogleAuth({
+    credentials: JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS!),
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
+  const sheets = google.sheets({ version: "v4", auth });
+  const delta = `${(row.bearish - row.bullish).toFixed(2)}%`;
 
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: "A2:D2",
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: [
+        [
+          row.reportedDate,
+          `${row.bullish}%`,
+          `${row.neutral}%`,
+          `${row.bearish}%`,
+        ],
+      ],
+    },
+  });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: "E2",
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [[delta]] },
+  });
+  console.log(
+    `Wrote to sheet: ${row.reportedDate} | bull=${row.bullish}% | neu=${row.neutral}% | bear=${row.bearish}% | delta=${delta} | source=${row.source}`
+  );
+}
+
+// ── Main workflow ─────────────────────────────────────────────────────────────
+async function runWorkflow() {
+  // ── Layer 1: Direct HTTP + cheerio (no browser) ──
+  console.log("Layer 1: trying direct HTTP + cheerio…");
   try {
-    // 1) Start a browser session
-    console.log("Initializing Stagehand…");
-    const mask = (s?: string) => (s ? `${s.slice(0,4)}…${s.slice(-4)}` : "MISSING");
-    if (process.env.DEBUG === "1") {
-      console.log("BB_API:", mask(process.env.BROWSERBASE_API_KEY));
-      console.log("BB_PROJ:", process.env.BROWSERBASE_PROJECT_ID ? "SET" : "MISSING");
-      console.log("GOOGLE_API_KEY:", mask(process.env.GOOGLE_API_KEY));
-      console.log("SHEETS_JSON:", process.env.GOOGLE_SHEETS_CREDENTIALS ? "SET" : "MISSING");
+    const row = await layer1Direct();
+    if (row) {
+      console.log("Layer 1 succeeded:", row);
+      await writeToSheets(row);
+      return row;
     }
+    console.warn("Layer 1: no valid data found — page may require JS");
+  } catch (e) {
+    console.warn("Layer 1 failed:", e);
+  }
+
+  // ── Layers 2 & 3: Browser-based ──
+  console.log("Falling back to browser-based extraction…");
+  let stagehand: Stagehand | null = null;
+  try {
+    console.log("Initializing Stagehand…");
     stagehand = new Stagehand(stagehandConfig());
     await stagehand.init();
     console.log("Stagehand initialized.");
 
-    // 2) Navigate + extract AAII sentiment (robust)
     const page = stagehand.page;
     if (!page) throw new Error("No page instance from Stagehand.");
 
-    let row: SentRow;
+    await page.goto(AAII_URL, { waitUntil: "load" });
+    // Give JS-rendered content time to paint
+    await new Promise((r) => setTimeout(r, 3000));
+
+    let row: SentRow | null = null;
+    let lastErr: Error | null = null;
+
+    // ── Layer 2: Screenshot → Gemini Vision ──
+    console.log("Layer 2: trying screenshot → Gemini Vision…");
     try {
-      row = await fetchAAII(page);
-      console.log("AAII row:", row);
+      row = await layer2Screenshot(page);
+      if (row) {
+        const v = validate(row);
+        if (!v.ok) {
+          console.warn(`Layer 2 vision returned invalid data: ${v.reason}`);
+          row = null;
+        } else {
+          console.log("Layer 2 succeeded:", row);
+        }
+      }
     } catch (e) {
-      console.warn("AAII scrape failed. Capturing artifacts then aborting:", e);
-      try { await page.screenshot({ path: "aaii-fail.png", fullPage: true }); } catch {}
-      try { await fs.writeFile("aaii-fail.html", await page.content()); } catch {}
-      throw e; // fail-fast, do NOT write to Sheets
+      console.warn("Layer 2 failed:", e);
+      lastErr = e instanceof Error ? e : new Error(String(e));
     }
 
-    const bullish = row.bullish;
-    const neutral = row.neutral;
-    const bearish = row.bearish;
-    const deltaNumber = bearish - bullish;
-    const deltaDisplay = `${deltaNumber.toFixed(2)}%`;
+    // ── Layer 3: Browser DOM + regex ──
+    if (!row) {
+      console.log("Layer 3: trying browser DOM + regex…");
+      try {
+        row = await layer3Browser(page);
+        if (row) {
+          const v = validate(row);
+          if (!v.ok) {
+            console.warn(`Layer 3 returned invalid data: ${v.reason}`);
+            row = null;
+          } else {
+            console.log("Layer 3 succeeded:", row);
+          }
+        } else {
+          lastErr = new Error("Layer 3: no data found");
+        }
+      } catch (e) {
+        console.warn("Layer 3 failed:", e);
+        lastErr = e instanceof Error ? e : new Error(String(e));
+      }
+    }
 
-    console.log(`Validated sum: ${(bullish + neutral + bearish).toFixed(2)}%`);
+    if (!row) {
+      // Save debug artifacts before giving up
+      try {
+        await page.screenshot({ path: "aaii-fail.png", fullPage: true });
+      } catch {}
+      try {
+        await fs.writeFile("aaii-fail.html", await page.content());
+      } catch {}
+      throw lastErr ?? new Error("All extraction layers failed");
+    }
 
-    // 4) Push validated sentiment data into Google Sheets
-    const SHEET_ID = process.env.SHEET_ID ?? "1zQQ2am1yhzTwY7nx8xPak4Q0WoNMwxWj7Ekr-fDEIF4";
-    const auth = new google.auth.GoogleAuth({
-      credentials: JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS!),
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-    });
-    const sheets = google.sheets({ version: "v4", auth });
-
-    // Write all sentiment percentages to the sheet
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: "A2:D2",
-      valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [[row.reportedDate, `${bullish}%`, `${neutral}%`, `${bearish}%`]],
-      },
-    });
-
-    // Write delta to column E
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: "E2",
-      valueInputOption: "USER_ENTERED",
-      requestBody: { values: [[deltaDisplay]] },
-    });
-    console.log(`Wrote sentiment data and ${deltaDisplay} delta to sheet.`);
-
-    // 5) Close browser session
+    await writeToSheets(row);
     await stagehand.close();
-    console.log("Stagehand closed.");
-
     return row;
   } catch (err) {
     console.error("Workflow failed:", err);
@@ -227,12 +333,14 @@ async function runWorkflow() {
   }
 }
 
-// kick it off
-runWorkflow()
-  .then((data) => {
-    console.log("Workflow finished successfully. Extracted data:", data);
-  })
-  .catch((err) => {
-    console.error("Workflow execution failed:", err);
-    process.exit(1);
-  });
+// Only run when invoked directly (not when imported by tests)
+if (require.main === module) {
+  runWorkflow()
+    .then((data) =>
+      console.log("Workflow finished successfully. Extracted data:", data)
+    )
+    .catch((err) => {
+      console.error("Workflow execution failed:", err);
+      process.exit(1);
+    });
+}
