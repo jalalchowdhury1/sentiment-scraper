@@ -2,3 +2,7 @@
 credentials/*.json
 aaii-fail.html
 aaii-fail.png
+# untracked: committed deps + secret backups (rotate the leaked keys!)
+node_modules/
+.env.bak
+*.bak
