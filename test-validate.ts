@@ -1,6 +1,7 @@
 /** Offline unit tests for lib/validate.ts. Run: npx ts-node test-validate.ts */
 import assert from "node:assert";
 import { validate, parseSurveyDate, daysOld } from "./lib/validate";
+import { alert, formatAlert } from "./lib/telegram";
 
 const NOW = new Date("2026-06-12T20:00:00Z");
 const row = (over: object) => ({ reportedDate: "Jun 10", bullish: 30.4, neutral: 22.0, bearish: 47.7, source: "t", ...over });
@@ -29,3 +30,13 @@ assert.match(warned.warn ?? "", /days old/);
 assert.equal(validate(row({ reportedDate: "???" }), NOW).ok, false);
 
 console.log("test-validate: ALL PASS");
+
+// --- lib/telegram.ts (offline behavior only) ---
+(async () => {
+  delete process.env.TELEGRAM_BOT_TOKEN;
+  delete process.env.TELEGRAM_CHAT_ID;
+  assert.equal(await alert("INFO", "test"), false); // no secrets -> silent no-op, returns false, never throws
+  assert.match(formatAlert("CRITICAL", "all tiers failed"), /^🚨 sentiment-scraper CRITICAL:\nall tiers failed$/);
+  assert.match(formatAlert("INFO", "x"), /^ℹ️ sentiment-scraper INFO:\nx$/);
+  console.log("test-telegram: ALL PASS");
+})().catch((e) => { console.error(e); process.exit(1); });
