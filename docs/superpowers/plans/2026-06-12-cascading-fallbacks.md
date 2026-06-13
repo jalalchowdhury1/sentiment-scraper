@@ -172,7 +172,7 @@ jobs:
             echo "[$name] status=$status pattern_hits='${matches:-NONE}'"
           }
           probe "aaii-direct"      "https://www.aaii.com/sentimentsurvey/sent_results"            "[A-Z][a-z]{2} +[0-9]{1,2}</td>|[0-9]+\.[0-9]%"
-          probe "substack-archive" "https://insights.aaii.com/api/v1/archive?sort=new&limit=12"   "\"slug\":\"[a-z0-9-]+\""
+          probe "substack-archive" "https://insights.aaii.com/api/v1/archive?sort=new&limit=30"   "\"slug\":\"[a-z0-9-]+\""
           probe "substack-rss"     "https://insights.aaii.com/feed"                               "<title>[^<]*[Ss]entiment[^<]*</title>"
           probe "ycharts-bullish"  "https://ycharts.com/indicators/us_investor_sentiment_bullish" "is at [0-9.]+%"
           probe "ycharts-neutral"  "https://ycharts.com/indicators/us_investor_sentiment_neutral" "is at [0-9.]+%"
@@ -473,7 +473,7 @@ export async function fetchAAIIHttp(now: Date = new Date()): Promise<SentRow | n
 
 ```bash
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-curl -sL -A "$UA" "https://insights.aaii.com/api/v1/archive?sort=new&limit=12" -o /tmp/substack-archive.json
+curl -sL -A "$UA" "https://insights.aaii.com/api/v1/archive?sort=new&limit=30" -o /tmp/substack-archive.json
 python3 -c "import json; d=json.load(open('/tmp/substack-archive.json')); print([p['slug'] for p in d][:5])"
 # pick the slug containing 'sentiment-survey', then:
 curl -sL -A "$UA" "https://insights.aaii.com/api/v1/posts/<THAT-SLUG>" | python3 -c "import json,sys; print(json.load(sys.stdin)['body_html'])" > fixtures/substack-post-body.html
@@ -555,7 +555,7 @@ type ArchivePost = { title?: string; slug?: string; post_date?: string; canonica
 export async function fetchSubstack(now: Date = new Date()): Promise<SentRow | null> {
   console.log("  [Tier 2] AAII Substack...");
   // 2a: archive JSON API -> post JSON API
-  const archiveRaw = await get(`${BASE}/api/v1/archive?sort=new&limit=12`, "application/json");
+  const archiveRaw = await get(`${BASE}/api/v1/archive?sort=new&limit=30`, "application/json");
   if (archiveRaw) {
     try {
       const posts = JSON.parse(archiveRaw) as ArchivePost[];
