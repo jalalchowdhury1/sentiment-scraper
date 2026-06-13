@@ -39,3 +39,16 @@ assert.equal(fRow!.bullish, 35.0);
 assert.equal(fRow!.neutral, 30.0);
 assert.equal(fRow!.bearish, 35.0);
 console.log("test-aaii-substack: ALL PASS");
+
+// --- sources/ycharts.ts ---
+import { parseYChartsPage, assembleYCharts } from "./sources/ycharts";
+const yc = (v: number) => `<meta name="description" content="In depth view... US Investor Sentiment, % Bull is at ${v}%, compared to ${v - 1}% last week and 20.9% last year... for Wk of Jun 10 2026.">`;
+assert.deepEqual(parseYChartsPage(yc(30.4)), { value: 30.4, weekOf: "Jun 10 2026" });
+assert.equal(parseYChartsPage("<html>paywall</html>"), null);
+const yRow = assembleYCharts({ bullish: { value: 30.4, weekOf: "Jun 10 2026" }, neutral: { value: 22.0, weekOf: "Jun 10 2026" }, bearish: { value: 47.7, weekOf: "Jun 10 2026" } }, NOW);
+assert.ok(yRow);
+assert.equal(yRow!.reportedDate, "Jun 10");
+assert.equal(yRow!.source, "ycharts");
+// mismatched weeks across the 3 pages -> reject
+assert.equal(assembleYCharts({ bullish: { value: 30.4, weekOf: "Jun 10 2026" }, neutral: { value: 22.0, weekOf: "Jun 3 2026" }, bearish: { value: 47.7, weekOf: "Jun 10 2026" } }, NOW), null);
+console.log("test-ycharts: ALL PASS");
