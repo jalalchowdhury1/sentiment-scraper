@@ -18,10 +18,13 @@ Sentiment Survey** (bullish / neutral / bearish percentages) from
 - **Language / stack:** TypeScript run directly via `ts-node` (CommonJS, `target es2018`).
   No build/compile step is used in CI (`outDir: dist` exists in `tsconfig.json` but is
   never produced).
-- **Browser:** Playwright (headless Chromium).
-- **Optional vision fallback:** Google Gemini (`gemini-2.5-flash`) via
-  `@google/generative-ai`.
-- **Sink:** Google Sheets API v4 via `googleapis` + a service-account.
+- **Source cascade (first valid + fresh row wins):** Tier 0 aaii.com plain-HTTP+regex
+  (no browser) → Tier 1 Playwright headless Chromium (4 internal layers, incl. an optional
+  Gemini `gemini-2.5-flash` vision layer via `@google/generative-ai`) → Tier 2 AAII's own
+  Substack `insights.aaii.com` (JSON API → RSS) → Tier 3 YCharts indicator pages.
+- **Sink:** Google Sheets API v4 via `googleapis` + a service-account (3 attempts w/ backoff).
+- **Alerts:** Telegram Bot API (plain HTTPS) — dormant/no-op until `TELEGRAM_BOT_TOKEN` +
+  `TELEGRAM_CHAT_ID` secrets exist.
 - **Repo:** `https://github.com/jalalchowdhury1/sentiment-scraper` (**public**), default
   branch `main`.
 
@@ -40,57 +43,64 @@ stub (`// Function to reverse a string`) and is not used by anything.
 ## 2. Architecture / data flow
 
 ```
-GitHub Actions cron (daily-scrape.yml, 08:00 UTC)
+GitHub Actions cron (daily-scrape.yml, 08:00 UTC) ── watchdog.yml (20:00 UTC) re-dispatches if stale
         │
         ▼
- ts-node sentiment-scraper.ts  ──▶  Playwright headless Chromium
-        │                                   │
-        │                           goto AAII sentiment page
-        │                                   │
-        │            ┌──────────────────────┴───────────────────────────┐
-        │            │  4-layer extraction cascade (first hit wins)       │
-        │            │  L1 DOM table → L2 text/regex → L3 alternatives →  │
-        │            │  L4 Gemini Flash vision (only if L1–L3 all fail)   │
-        │            └──────────────────────┬───────────────────────────┘
-        │                                   │ SentRow {date,bull,neu,bear,source}
-        ▼                                   ▼
-   validate(row)  ──fail──▶ throw → workflow retries (up to 10× / 15 min apart)
-        │ ok
+ ts-node sentiment-scraper.ts  ── runWorkflow(): SOURCE-TIER CASCADE (first valid+fresh wins)
+        │
+        ├─ Tier 0  sources/aaii-http.ts     plain HTTPS GET + table regex (no browser, ~2s)
+        ├─ Tier 1  scrapeAAII()             Playwright Chromium, internal layers L1→L2→L3→L4
+        ├─ Tier 2  sources/aaii-substack.ts insights.aaii.com JSON API → RSS  (first-party backup)
+        └─ Tier 3  sources/ycharts.ts       3 YCharts indicator pages         (third-party backup)
+        │                                   each returns SentRow {date,bull,neu,bear,source} | null
         ▼
-   writeToSheets() ──▶ Google Sheets API v4 (service-account)
-        ├─ A2:D2  = reportedDate, bullish%, neutral%, bearish%
-        └─ E2     = delta = (bearish − bullish)%
+   validate(row)  (lib/validate.ts: range + sum±0.8 + freshness ≤14d)
+        │ ok                                   │ all tiers fail
+        ▼                                       ▼
+   writeToSheets()  3 attempts (5s/15s/45s)   throw → workflow retry harness (≤10× / 15min)
+        ├─ anti-regression: skip if sheet date NEWER than candidate          → on exhaustion: 🚨 Telegram
+        ├─ A2:D2 = reportedDate, bullish%, neutral%, bearish%
+        ├─ E2    = delta = (bearish − bullish)%
+        ├─ F2    = "updated <ISO-UTC> via <source>"  (watchdog reads this)
+        └─ on write failure after 3 tries → 🚨 Telegram (with the numbers, for manual entry)
 ```
 
-### The 4-layer extraction cascade (`sentiment-scraper.ts`)
-`scrapeAAII()` navigates once, then tries layers in order and returns the **first** layer
-that produces a row passing the inline `sum ≈ 100` check. Each layer is `export`ed so the
-test harness can call it in isolation.
+### The source-tier cascade (`runWorkflow` in `sentiment-scraper.ts`)
+`runWorkflow()` tries the four tiers in order and returns the **first** row that passes
+`validate()`. A tier throwing is caught and logged; the loop continues. If a backup tier
+(≥ Tier 2) wins, an INFO Telegram alert fires ("aaii.com path failed; used backup …").
 
-1. **`layer1DOMTable`** — finds `<table>` rows whose first cell matches a `Mon DD` date
-   pattern and parses cells 1–3 as bullish/neutral/bearish percents. The common path.
-2. **`layer2TextRegex`** — scrapes `body` text + data-attribute elements with several
-   regexes (plain `Mon DD 32.1% 18.1% 49.8%`, labeled `Bullish/Neutral/Bearish`, and a
-   JSON-ish `"date":…"bullish":…` shape).
-3. **`layer3Alternative`** — four sub-methods: (a) regex over full `page.content()` HTML,
-   (b) `page.evaluate()` scanning inline `<script>` tags + `window.sentimentData` /
-   `window.aaiiData`, (c) re-try the DOM table under a **mobile viewport** (375×667), and
-   (d) `page.reload({waitUntil:"networkidle"})` then re-try the DOM table.
-4. **`layer4VisionLLM`** — screenshots the full page, sends it to **Gemini 2.5 Flash** with
-   a prompt to return `{"date","bullish","neutral","bearish"}` JSON, parses it (tolerating
-   markdown code fences). **Skipped entirely if `GOOGLE_API_KEY` is unset.** This costs API
-   credits, so it only runs as a last resort.
+- **Tier 0 — `fetchAAIIHttp` (`sources/aaii-http.ts`):** plain `fetch()` of the
+  server-rendered sent_results page + strict cell regex (loose tag-stripped fallback).
+  Imperva-fronted but **does not block GitHub Actions IPs** (probe-verified). The common path.
+- **Tier 1 — `scrapeAAII` (`sentiment-scraper.ts`):** the original Playwright cascade,
+  unchanged. Navigates once, then tries internal layers, first inline-`sum≈1%` hit wins:
+  1. `layer1DOMTable` — `<table>` rows, first cell `Mon DD`, cells 1–3 = bull/neu/bear.
+  2. `layer2TextRegex` — `body` text + data-attribute regexes.
+  3. `layer3Alternative` — (a) `page.content()` regex, (b) `page.evaluate()` script/window
+     scan, (c) mobile-viewport retry, (d) reload+retry.
+  4. `layer4VisionLLM` — full-page screenshot → **Gemini 2.5 Flash** → JSON. **Skipped if
+     `GOOGLE_API_KEY` unset.** Costs credits; last resort within Tier 1. On total Tier-1
+     failure it dumps `aaii-fail.png`/`aaii-fail.html` (gitignored) and returns null.
+- **Tier 2 — `fetchSubstack` (`sources/aaii-substack.ts`):** AAII's own Substack. Hits the
+  archive JSON API (`/api/v1/archive?sort=new&limit=30` — the sentiment post is often not in
+  the newest dozen), finds the `…sentiment-survey…` post, parses `body_html` prose. Falls
+  back to the RSS `/feed`. **Typically lags the website by ~1 week** (posted later), so it's
+  a lower tier. The label→number regex uses a negative lookahead so a summary sentence that
+  names a label without a number can't steal the next label's percentage.
+- **Tier 3 — `fetchYCharts` (`sources/ycharts.ts`):** 3 indicator pages; latest value +
+  "Wk of <date>" are server-rendered in page prose. All three must agree on the week.
 
-On total failure (`scrapeAAII` returns `null`) the scraper attempts to dump
-`aaii-fail.png` + `aaii-fail.html` for debugging (both are gitignored), then the workflow
-returns null → `runWorkflow()` throws → the job fails → the retry harness fires.
-
-### Validation (the data-quality gate)
-- Per-layer (inline in each layer): rejects a row unless `|bullish+neutral+bearish − 100| ≤ 1`.
-- Top-level `validate()` in `runWorkflow()` (and mirrored in every test file): each percent
-  must be 0–100 **and** the sum must be within **0.8** of 100, else it throws and nothing is
-  written. **Keep these tolerances consistent** if you touch one — the test files duplicate
-  the function verbatim.
+### Validation (the data-quality gate) — `lib/validate.ts` (single source of truth)
+- `validate(row, now?)`: each percent 0–100, `|sum − 100| ≤ 0.8`, and **freshness** — the
+  survey date must parse and be ≤ 14 days old (8–14 days → `ok` with a `warn`). Returns
+  `{ok, reason?, warn?}`.
+- `parseSurveyDate` handles `"Jun 10"`, `"Jun 04 2026"`, `"June 10"`, ISO `2026-06-11`, and
+  the Dec-in-January year-wrap.
+- Per-layer inline checks inside Tier 1 still use `±1` (historical, untouched). The shared
+  `validate()` replaced the old copy-pasted function — test harnesses that still inline their
+  own `validate` (`test-layers`, `test-comprehensive`, `quick-test`) are self-contained and
+  unaffected.
 
 ---
 
@@ -99,11 +109,11 @@ returns null → `runWorkflow()` throws → the job fails → the retry harness 
 ### Local
 ```bash
 npm ci
-node node_modules/playwright/cli.js install --with-deps chromium   # CI install style
-# or: npx playwright install chromium
+node node_modules/playwright/cli.js install chromium   # project CLI — version-matched to the package
 
-cp .env.bak .env            # then fill in real values (see §4)
-npm run scrape:aaii         # = ts-node sentiment-scraper.ts  (WRITES TO THE SHEET)
+# create .env with real values (see §4); there is NO committed .env.bak anymore
+npm run scrape:aaii            # = ts-node sentiment-scraper.ts  (WRITES TO THE SHEET)
+DRY_RUN=1 npm run scrape:aaii  # full cascade, NO sheet write, NO alerts — safe to run anywhere
 ```
 A VS Code launch config (`.vscode/launch.json`, **"Scrape AAII"**) runs the scraper under
 `ts-node` with `envFile=.env`.
@@ -111,33 +121,38 @@ A VS Code launch config (`.vscode/launch.json`, **"Scrape AAII"**) runs the scra
 ### Test harnesses (none write to the sheet)
 | Command | What it does |
 |---|---|
-| `npx ts-node test-layers.ts` | Runs L1–L3 against the **live** AAII page; runs L4 only if L1–L3 fail. Exits non-zero only if all of L1–L3 fail. This is the CI gate in both workflows. |
-| `npx ts-node test-comprehensive.ts` | Normal mode: L1–L3 vs live page, skips L4. |
-| `npx ts-node test-comprehensive.ts --force4` | Uses a mock no-data page to drive the fallback path (L4 can't run on the mock). |
-| `npx ts-node test-comprehensive.ts --layer4` | Standalone L4 test against the live page (**costs Gemini credits**). |
-| `npx ts-node quick-test.ts` | Pure-offline unit test: feeds 3 canned HTML strings via `page.setContent` and asserts the L1–L3 recover/fail behavior. |
+| `npm test` | **Offline suite (no network):** `test-validate.ts` (validate/date parsing + telegram no-op) → `test-sources-offline.ts` (Tier 0/2/3 parsers vs committed `fixtures/`) → `quick-test.ts` (Tier-1 layers vs canned HTML). |
+| `npx ts-node test-tiers.ts` | **Live per-tier diagnostic** — runs all 4 tiers against live sources, prints PASS/FAIL each, exits 0 if **≥1** tier yields valid fresh data. This is the CI gate in `test.yml`. |
+| `npx ts-node test-layers.ts` | Live Tier-1 layer diagnostic. Exits non-zero only if **all** layers fail (fixed — was previously "all of L1–L3 must pass"). |
+| `npx ts-node test-comprehensive.ts [--force4\|--layer4]` | Tier-1 layer test modes; `--layer4` hits Gemini (**costs credits**). |
 | `npx ts-node test-gemini.ts` | Sanity-checks that `GOOGLE_API_KEY` works (text + a 1×1-pixel vision call). |
+| `npx ts-node watchdog.ts` | Reads the sheet's F2/A2 freshness; prints STALE/FRESH. Needs `GOOGLE_SHEETS_CREDENTIALS`. |
 
 ### GitHub Actions (the only "deploy")
 - **`.github/workflows/daily-scrape.yml`** — the production job.
-  - **Schedule:** `cron: '0 8 * * *'` → **08:00 UTC daily**. (The inline comment says
-    "= 04:00 EDT"; that's only true during US daylight time — it's 03:00 EST in winter.)
+  - **Schedule:** `cron: '0 8 * * *'` → **08:00 UTC daily** (≈04:00 EDT / 03:00 EST).
   - Also `workflow_dispatch` with a `retry_count` input (used by the self-retry loop).
-  - Steps: checkout → Node 22 → `npm ci` → install Chromium → run `test-layers.ts` (gate) →
-    run `sentiment-scraper.ts` with `continue-on-error: true`.
-  - **Self-retry harness:** if the scraper step fails, the next step `sleep 900` (15 min)
-    then POSTs to the GitHub API to re-dispatch this same workflow with
-    `retry_count+1`, up to **`MAX_RETRIES=10`** (~2.5h of attempts). A final step
-    re-fails the job so the run shows red. Needs `permissions: actions: write`.
-- **`.github/workflows/test.yml`** ("Test Layers") — runs on **push/PR to `main`**. Three
-  jobs: `test` (`test-layers.ts`), `test-layer4` (`test-comprehensive.ts --layer4`,
-  **spends Gemini credits on every push/PR**), and `scrape` (needs `test`; actually runs
-  `sentiment-scraper.ts` and **writes to the sheet on every push to `main`** — see Gotchas).
-- **`.github/workflows/keepalive.yml`** — `cron: '17 3 1,15 * *'` (03:17 UTC on the 1st &
-  15th). Makes an **empty `[skip ci]` commit only if the repo has been idle ≥ 40 days**,
-  resetting GitHub's 60-day inactivity timer so the cron workflows never auto-disable.
-  `workflow_dispatch` has a `force` boolean to commit regardless. Needs
-  `permissions: contents: write`.
+  - Steps: checkout → Node 22 → `npm ci` → install Chromium → run `sentiment-scraper.ts`
+    with `continue-on-error: true`. **No pre-scrape gate** (the cascade is its own gate).
+  - **Self-retry harness:** retry step fires `if: always() && steps.scraper.outcome != 'success'`
+    (so it fires even when an earlier step failed and the scraper was skipped), `sleep 900`,
+    re-dispatches with `retry_count+1`, up to **`MAX_RETRIES=10`**. On exhaustion it sends a
+    🚨 Telegram alert, then a final step re-fails the job. Needs `permissions: actions: write`.
+- **`.github/workflows/test.yml`** — runs on **push/PR to `main`** + `workflow_dispatch`. Jobs:
+  `test` (`test-tiers.ts`), `test-layer4` (`if: workflow_dispatch` only — **no Gemini spend on
+  push/PR**), and `scrape` (needs `test`; runs the scraper with **`DRY_RUN=1` — no sheet write**).
+- **`.github/workflows/watchdog.yml`** — `cron: '0 20 * * *'` (20:00 UTC) + dispatch. Runs
+  `watchdog.ts`; if the sheet's last successful write is stale (>26h via F2 stamp, or >9d via
+  A2 date) it re-dispatches `daily-scrape.yml` **once** and sends a 🚨 Telegram alert. Never
+  retries itself (no loop). Catches silently-skipped crons. Needs `permissions: actions: write`.
+- **`.github/workflows/probe-sources.yml`** — `workflow_dispatch` only. Curls every source
+  from a real GHA runner and prints HTTP status + regex hits. Diagnostic for re-checking
+  datacenter-IP access. **Probe result (2026-06-13, run 27451648730): all four sources
+  returned 200 from GHA** — aaii.com (`Jun 10 30.4/22.0/47.7`, Imperva does not block GHA),
+  Substack archive (200; sentiment post beyond newest 12 → `limit=30`), YCharts ×3 (200).
+- **`.github/workflows/keepalive.yml`** — `cron: '17 3 1,15 * *'`. Empty `[skip ci]` commit
+  only if the repo has been idle ≥ 40 days, to dodge GitHub's 60-day cron auto-disable.
+  Unchanged. Needs `permissions: contents: write`.
 
 ---
 
@@ -145,15 +160,15 @@ A VS Code launch config (`.vscode/launch.json`, **"Scrape AAII"**) runs the scra
 
 | Var | Used by | Purpose |
 |---|---|---|
-| `GOOGLE_SHEETS_CREDENTIALS` | scraper (`writeToSheets`) | Full **service-account JSON** (as a string) for Sheets write auth. Required to write. |
-| `SHEET_ID` | scraper | Target spreadsheet id. **Falls back to a hardcoded default** `1zQQ2am1yhzTwY7nx8xPak4Q0WoNMwxWj7Ekr-fDEIF4` in `sentiment-scraper.ts` if unset. |
-| `GOOGLE_API_KEY` | scraper L4 + Gemini tests | Gemini Flash key. If absent, L4 silently skips (L1–L3 still work). |
-| `GOOGLE_GENERATIVE_AI_API_KEY` | (set in daily workflow only) | Mirror of `GOOGLE_API_KEY`; set as job env but the code reads `GOOGLE_API_KEY`. |
-| `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` | nothing | Set in the daily workflow env and present in `.env.bak`, but **no source file reads them** (vestigial — see Gotchas). |
+| `GOOGLE_SHEETS_CREDENTIALS` | scraper (`writeToSheets`), watchdog | Full **service-account JSON** (as a string) for Sheets auth. Required to write. |
+| `SHEET_ID` | scraper, watchdog | Target spreadsheet id. **Falls back to a hardcoded default** `1zQQ2am1yhzTwY7nx8xPak4Q0WoNMwxWj7Ekr-fDEIF4` if unset. |
+| `GOOGLE_API_KEY` | Tier-1 layer4 + Gemini tests | Gemini Flash key. If absent, layer4 silently skips (Tier 0/2/3 + Tier-1 L1–L3 still work). |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | `lib/telegram.ts`, daily/watchdog alert steps | **Optional.** Reuse an existing bot's token. Absent → all alerts are logged no-ops (nothing breaks). |
 
 - **Where secrets live:** GitHub Actions repo secrets (`GOOGLE_SHEETS_CREDENTIALS`,
-  `GOOGLE_API_KEY`, `SHEET_ID`, `BROWSERBASE_*`). Locally, a `.env` file (gitignored) loaded
-  via `dotenv`.
+  `GOOGLE_API_KEY`, `SHEET_ID`, and the two `TELEGRAM_*`). Locally, a `.env` file
+  (gitignored) loaded via `dotenv`. The `GOOGLE_GENERATIVE_AI_API_KEY` and `BROWSERBASE_*`
+  env vars were removed from the workflows (nothing read them).
 - The service-account is `sheets-writer@gen-lang-client-0758527558.iam.gserviceaccount.com`
   (project `gen-lang-client-0758527558`). The target sheet must be shared with that account
   for writes to succeed.
@@ -163,64 +178,61 @@ A VS Code launch config (`.vscode/launch.json`, **"Scrape AAII"**) runs the scra
 
 ## 5. Gotchas / hard rules (highest-value section)
 
-1. **🔴 SECRETS ARE COMMITTED TO THIS PUBLIC REPO.** Despite `.gitignore` listing
-   `credentials/*.json` and `.env`, two real-secret files are **tracked in git**:
-   - `credentials/sheets-writer.json` — a **live Google service-account private key**.
-   - `.env.bak` — a `.env` copy containing real `GOOGLE_API_KEY`, `BROWSERBASE_API_KEY`,
-     `BROWSERBASE_PROJECT_ID`, and `SHEET_ID` values.
-   These were committed before/around the ignore rules, so `.gitignore` does nothing for
-   them now. **Owner action required:** rotate the Gemini key, the Browserbase key, and the
-   service-account key; `git rm --cached` both files (and purge from history); the sheet
-   should be re-shared with a fresh service account. Do **not** assume these are dummy.
-2. **`node_modules/` is committed (~10k files).** The repo vendors all dependencies into git
-   and `node_modules` is **not** in `.gitignore`. CI still runs `npm ci` (which wipes/reinstalls
-   it from the lockfile), so the committed copy is dead weight. Don't rely on editing the
-   committed `node_modules`; change `package.json` instead. (`.DS_Store` is also tracked.)
-3. **Pushing to `main` writes to the live sheet.** `test.yml`'s `scrape` job runs the real
-   `sentiment-scraper.ts` with the real `GOOGLE_SHEETS_CREDENTIALS`/`SHEET_ID` on **every
-   push and the daily cron also writes**. There is no dry-run guard. If you push code
-   changes to `main`, expect a sheet write. Use a branch + PR if you don't want that.
-4. **`test.yml` spends Gemini credits on every push/PR.** The `test-layer4` job calls the
-   real vision model unconditionally. If cost matters, gate or remove that job.
-5. **The sheet write is a fixed-cell OVERWRITE, not an append.** `writeToSheets` writes
-   `A2:D2` and `E2` only — it always clobbers row 2 with the latest survey and never keeps
-   history in the sheet itself. Row 1 is assumed to be headers. Don't "fix" this into an
-   append without checking what downstream consumers expect.
-6. **`delta = (bearish − bullish)` formatted as a string `"x.xx%"`** goes into `E2` with
-   `valueInputOption: USER_ENTERED`. A leading `-` makes Sheets treat it as text, not a
-   number — intended here, but be aware if a consumer expects a numeric delta.
-7. **L4 is gated on `GOOGLE_API_KEY`.** No key → L4 returns null immediately, so the scraper
-   depends on L1–L3 succeeding. That's fine in steady state but removes the safety net.
-8. **Validation tolerances differ by layer.** Per-layer inline checks allow `±1`; the
-   top-level/test `validate()` allows only `±0.8`. A row can pass a layer but fail the final
-   gate. Keep that in mind when debugging a "scraped but threw" failure.
-9. **Stale code comments — trust the code.** `scrapeAAII`'s comment says "runs all 3 layers"
-   but it runs **4** (L4 was added later). Various test banners still say "3 layers". There
-   is no "Layer 5"/Browserbase path despite the `@browserbasehq/stagehand` dependency.
-10. **Vestigial dependencies.** `@browserbasehq/stagehand`, `cheerio`, and `zod` are in
-    `package.json` but **not imported by any source file** (only `playwright`, `googleapis`,
-    `@google/generative-ai`, and `dotenv` are actually used). Safe to leave, but don't assume
-    they do anything.
-11. **Node 22 in CI, `ts-node` everywhere.** No transpile/build artifact is produced or
-    shipped; everything runs through `ts-node`. `npm run build` does not exist.
-12. **AAII page is the single external dependency.** If AAII changes its DOM/markup, L1–L3
-    can all silently miss and the run will lean on L4 (cost) or fail into the retry loop.
-    The `aaii-fail.png` / `aaii-fail.html` artifacts (written on total failure, gitignored)
-    are the first thing to inspect.
+1. **🔴 LEAKED SECRETS — rotation may still be pending.** `credentials/sheets-writer.json`
+   (a live service-account key) and `.env.bak` (real `GOOGLE_API_KEY`, `BROWSERBASE_*`,
+   `SHEET_ID`) were **untracked from the working tree** on 2026-06-08 (`0f0ce38`) and their
+   **blobs purged from git history** during the cascade work (see §6 for date). **A purge is
+   not a rotation:** anyone who cloned before, or any fork, still has the old keys, and GitHub
+   may serve orphaned commits by SHA until GC. **The real mitigation is rotation** — confirm
+   the Gemini key and the `sheets-writer@gen-lang-client-0758527558` service-account key were
+   rotated (and the Browserbase key deleted). If §6 still lists rotation as open, treat the
+   old keys as live.
+2. **The sheet write is a fixed-cell OVERWRITE, not an append.** `writeToSheets` writes
+   `A2:D2`, `E2`, and `F2` only — it clobbers row 2 with the latest survey and never keeps
+   history in the sheet. Row 1 is headers. Don't "fix" this into an append without checking
+   downstream consumers.
+3. **`delta = (bearish − bullish)` is a string `"x.xx%"`** written to `E2` with
+   `USER_ENTERED`. A leading `-` makes Sheets treat it as text — intended; beware if a
+   consumer expects a numeric delta.
+4. **F2 is a freshness stamp (`updated <ISO> via <source>`).** The watchdog reads it.
+   `writeToSheets` only writes F2 if F2 is empty or already a prior stamp (so it won't
+   clobber an unrelated value a human put there); otherwise it skips the stamp and the
+   watchdog falls back to the A2 survey date.
+5. **Anti-regression guard:** before writing, `writeToSheets` reads A2 and **skips the write
+   if the sheet's survey date is newer than the candidate's** (prevents a late retry that only
+   reached a lagging backup — e.g. Substack runs ~1 week behind — from overwriting fresher
+   data). It sends an INFO alert and returns without error.
+6. **Backup-source freshness varies.** Tier 2 (Substack) typically lags the website by ~1
+   week; Tier 3 (YCharts) is usually same-day. The freshness gate (≤14d) and tier ordering
+   (first-party aaii.com first) handle this, but a Tier-2/3 win means the sheet may show a
+   slightly older survey date than the website currently shows. A backup win sends an INFO alert.
+7. **layer4 (Gemini) is gated on `GOOGLE_API_KEY`** — but it's now only one rung of Tier 1.
+   No key just means Tier 1 leans on L1–L3; Tiers 0/2/3 are the real safety net.
+8. **Two sum tolerances by design.** Tier-1 inline layer checks use `±1`; the shared
+   `validate()` (`lib/validate.ts`) uses `±0.8` + freshness. A row can pass a layer but fail
+   the final gate — expected.
+9. **Node 22 in CI, `ts-node` everywhere.** No build artifact; `npm run build` does not exist.
+10. **No longer a single point of failure.** Four independent sources back each other (probe
+    confirmed all four reachable from GHA). If aaii.com changes markup, Tier 0/1 may miss but
+    Tier 2/3 cover it (and you get an INFO alert). Tier-1 total failure still dumps
+    `aaii-fail.png`/`aaii-fail.html` (gitignored).
+11. **`fixtures/` are real captures pinned in time.** Offline tests freeze `now` at
+    2026-06-12 so the fixtures never "age out" of the freshness gate. If you re-capture a
+    fixture, keep the test's frozen `NOW` consistent with it.
 
 ---
 
 ## 6. Known issues / open items (owner action)
 
-- **Rotate & purge committed secrets** (see Gotcha #1): Gemini key, Browserbase key,
-  service-account JSON, then `git rm --cached credentials/sheets-writer.json .env.bak` and
-  scrub history.
-- **Add `node_modules/` and `.DS_Store` to `.gitignore`** and `git rm -r --cached
-  node_modules` to stop vendoring ~10k files.
-- **Decide whether `main`-push should write to the sheet** (Gotcha #3) and whether the
-  per-push Gemini L4 test (Gotcha #4) is worth the spend.
-- **Clean up scaffolding:** `package.json` name/main/test fields, the unused `test.js`,
-  and the unused deps still reflect a leftover template.
+- **🔴 ROTATE THE LEAKED KEYS** (the one thing a history purge does NOT fix): Gemini
+  `GOOGLE_API_KEY`, the `sheets-writer@gen-lang-client-0758527558` service-account key
+  (create new → update `GOOGLE_SHEETS_CREDENTIALS` secret → delete old), and delete the
+  Browserbase key. *(Mark done here once rotated, with date.)*
+- **Add Telegram secrets** (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) to enable alerts —
+  optional; everything works without them (alerts are logged no-ops).
+- **Resolved during the cascade work:** committed secrets untracked + history-purged;
+  `node_modules`/`.DS_Store` untracked; push no longer writes the sheet (DRY_RUN); per-push
+  Gemini spend gated off; `package.json` metadata fixed; unused deps removed.
 
 ---
 
@@ -228,18 +240,27 @@ A VS Code launch config (`.vscode/launch.json`, **"Scrape AAII"**) runs the scra
 
 | Path | Role |
 |---|---|
-| `sentiment-scraper.ts` | **The scraper.** `setupBrowser`, `layer1DOMTable`/`layer2TextRegex`/`layer3Alternative`/`layer4VisionLLM` (all exported), `scrapeAAII` (the cascade), `validate`, `writeToSheets`, `runWorkflow`. Runs only when invoked directly (`require.main === module`). |
-| `test-layers.ts` | CI gate. Runs L1–L3 on the live page, L4 only if those fail. No sheet write. |
-| `test-comprehensive.ts` | Test modes: normal (L1–L3), `--force4` (mock no-data page), `--layer4` (standalone live L4). No sheet write. |
-| `quick-test.ts` | Offline unit test of L1–L3 recover/fail on 3 canned HTML inputs via `page.setContent`. |
-| `test-gemini.ts` | Verifies `GOOGLE_API_KEY` (text + tiny vision call). |
-| `test.js` | Empty stub (`// Function to reverse a string`). Unused. |
-| `package.json` | Deps + the `scrape:aaii` script. Name/main/test are leftover scaffolding. |
-| `tsconfig.json` | CommonJS, `target es2018`, `strict`, `outDir dist` (dist never built). |
-| `.github/workflows/daily-scrape.yml` | Daily 08:00 UTC scrape + self-retry loop (≤10×). |
-| `.github/workflows/test.yml` | Push/PR: `test`, `test-layer4` (paid), `scrape` (writes sheet). |
-| `.github/workflows/keepalive.yml` | Empty-commit keepalive (≥40-day idle guard) to dodge GitHub's 60-day cron auto-disable. |
+| `sentiment-scraper.ts` | **Tier 1 + orchestrator.** `setupBrowser`, `layer1DOMTable`/`layer2TextRegex`/`layer3Alternative`/`layer4VisionLLM` + `scrapeAAII` (all exported, unchanged), `writeToSheets` (3-try + anti-regression + F2 stamp), `runWorkflow` (the tier cascade). Runs only when invoked directly. |
+| `lib/types.ts` | The shared `SentRow` type. |
+| `lib/validate.ts` | `validate` (range + sum±0.8 + freshness), `parseSurveyDate`, `daysOld`. Single source of truth. |
+| `lib/telegram.ts` | `alert(level, msg)` / `formatAlert` — dormant no-op without secrets. |
+| `sources/aaii-http.ts` | Tier 0: `fetchAAIIHttp` + `parseAAIIHtml`; exports `CHROME_HEADERS`. |
+| `sources/aaii-substack.ts` | Tier 2: `fetchSubstack` (API→RSS) + `parseSubstackBody`. |
+| `sources/ycharts.ts` | Tier 3: `fetchYCharts` + `parseYChartsPage` + `assembleYCharts`. |
+| `watchdog.ts` | Reads sheet F2/A2 freshness → STALE/FRESH + `$GITHUB_OUTPUT`. Used by watchdog.yml. |
+| `test-validate.ts` | Offline: validate/date-parse + telegram no-op. |
+| `test-sources-offline.ts` | Offline: Tier 0/2/3 parsers vs `fixtures/`. |
+| `test-tiers.ts` | **CI gate** (`test.yml`). Live per-tier; exits 0 if ≥1 tier valid. |
+| `test-layers.ts` | Live Tier-1 layer diagnostic (exit fixed: fails only if all layers fail). |
+| `test-comprehensive.ts` / `test-gemini.ts` | Tier-1 layer modes / Gemini key check. |
+| `fixtures/` | Real captured `aaii-sent-results.html`, `substack-post-body.html` for offline parser tests. |
+| `package.json` | 4 real deps (`playwright`, `googleapis`, `@google/generative-ai`, `dotenv`); `test`/`test:tiers`/`scrape:aaii`/`watchdog` scripts. |
+| `tsconfig.json` | CommonJS, `target es2018`, `lib: [es2020, dom, dom.iterable]`, `strict`. |
+| `.github/workflows/daily-scrape.yml` | Daily 08:00 UTC cascade + self-retry (≤10×) + exhaustion alert. |
+| `.github/workflows/test.yml` | Push/PR + dispatch: `test` (test-tiers), `test-layer4` (dispatch-only), `scrape` (DRY_RUN). |
+| `.github/workflows/watchdog.yml` | 20:00 UTC freshness check → re-dispatch + alert. |
+| `.github/workflows/probe-sources.yml` | Dispatch-only: curl each source from GHA, print status. |
+| `.github/workflows/keepalive.yml` | Empty-commit keepalive (≥40-day idle guard). |
+| `docs/superpowers/specs|plans/` | The cascading-fallbacks design spec + implementation plan. |
+| `.gitignore` | Ignores `.env`, `credentials/*.json`, `aaii-fail.*`, `node_modules/`, `.env.bak`, `*.bak`. |
 | `.vscode/launch.json` | "Scrape AAII" debug config (ts-node + `.env`). |
-| `.env.bak` | **Committed secrets** (should be removed/rotated). |
-| `credentials/sheets-writer.json` | **Committed service-account key** (should be removed/rotated). |
-| `.gitignore` | Ignores `.env`, `credentials/*.json`, `aaii-fail.*` — but the above were committed before it took effect. |

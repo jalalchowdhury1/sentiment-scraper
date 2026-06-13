@@ -14,13 +14,10 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@browserbasehq/stagehand": "^2.3.1",
     "@google/generative-ai": "^0.24.1",
-    "cheerio": "^1.0.0-rc.12",
     "dotenv": "^16.0.0",
     "googleapis": "^150.0.1",
-    "playwright": "^1.58.2",
-    "zod": "^3.25.67"
+    "playwright": "^1.58.2"
   },
   "devDependencies": {
     "@types/node": "^24.0.3",
