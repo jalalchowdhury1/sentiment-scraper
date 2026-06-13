@@ -1,0 +1,48 @@
+name: Watchdog
+# Catches days where the daily scrape never ran (GitHub silently skips crons
+# sometimes — e.g. May 28-30, 2026) or ran but never wrote. If the sheet is
+# stale by 20:00 UTC, re-dispatch the scraper once and alert.
+on:
+  schedule:
+    - cron: '0 20 * * *'   # 20:00 UTC — 12h after the 08:00 scrape window
+  workflow_dispatch:
+
+permissions:
+  actions: write   # re-dispatch daily-scrape.yml
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: npm ci
+      - name: Check sheet freshness
+        id: check
+        run: npx ts-node watchdog.ts
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+      - name: Re-dispatch daily scrape
+        if: steps.check.outputs.stale == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/daily-scrape.yml/dispatches \
+            -d '{"ref":"main","inputs":{"retry_count":"0"}}'
+      - name: Alert
+        if: steps.check.outputs.stale == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode text="🚨 sentiment-scraper WATCHDOG: sheet is stale (${{ steps.check.outputs.detail }}). Re-dispatched the daily scrape. https://github.com/${{ github.repository }}/actions" || true
+          fi
