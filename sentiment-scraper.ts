@@ -462,6 +462,10 @@ async function runWorkflow() {
     const v = validate(row);
     if (v.ok) {
       console.log("\nScraping succeeded:", row);
+      if (process.env.DRY_RUN) {
+        console.log("[DRY_RUN] Skipping sheet write.");
+        return row;
+      }
       await writeToSheets(row);
       return row;
     } else {

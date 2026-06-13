@@ -21,10 +21,9 @@ jobs:
     # 👇 Job-level env ensures every step sees these
     env:
       GOOGLE_API_KEY:               ${{ secrets.GOOGLE_API_KEY }}
-      GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      BROWSERBASE_API_KEY:          ${{ secrets.BROWSERBASE_API_KEY }}
-      BROWSERBASE_PROJECT_ID:       ${{ secrets.BROWSERBASE_PROJECT_ID }}
       GOOGLE_SHEETS_CREDENTIALS:    ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+      TELEGRAM_BOT_TOKEN:           ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:             ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - uses: actions/checkout@v6
@@ -40,16 +39,13 @@ jobs:
       - name: Install Playwright browsers
         run: node node_modules/playwright/cli.js install --with-deps chromium
 
-      - name: Test all extraction layers
-        run: npx ts-node test-layers.ts
-
       - name: Run scraper
         id: scraper
         run: npx ts-node sentiment-scraper.ts
         continue-on-error: true
 
       - name: Retry on failure
-        if: steps.scraper.outcome == 'failure'
+        if: always() && steps.scraper.outcome != 'success'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RETRY_COUNT: ${{ github.event.inputs.retry_count || '0' }}
@@ -75,9 +71,14 @@ jobs:
             echo "Retry scheduled successfully"
           else
             echo "Max retries ($MAX_RETRIES) reached. Giving up."
+            if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TELEGRAM_CHAT_ID}" \
+                --data-urlencode text="🚨 sentiment-scraper CRITICAL: daily scrape failed after ${MAX_RETRIES} retries. Sheet keeps last good value. https://github.com/${{ github.repository }}/actions" || true
+            fi
             exit 1
           fi
 
       - name: Mark as failed if scraper failed
-        if: steps.scraper.outcome == 'failure'
+        if: always() && steps.scraper.outcome != 'success'
         run: exit 1
