@@ -3,28 +3,19 @@ import { chromium, Browser, Page } from "playwright";
 import { google } from "googleapis";
 import fs from "node:fs/promises";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { SentRow } from "./lib/types";
+import { validate, parseSurveyDate } from "./lib/validate";
+import { alert } from "./lib/telegram";
+import { fetchAAIIHttp } from "./sources/aaii-http";
+import { fetchSubstack } from "./sources/aaii-substack";
+import { fetchYCharts } from "./sources/ycharts";
+
+export type { SentRow };
 
 const AAII_URL = "https://www.aaii.com/sentimentsurvey/sent_results";
 
-type SentRow = {
-  reportedDate: string;
-  bullish: number;
-  neutral: number;
-  bearish: number;
-  source: string;
-};
-
 function pctToNum(txt: string): number {
   return parseFloat(txt.replace(/[%\s,]/g, ""));
-}
-
-function validate(row: SentRow): { ok: boolean; reason?: string } {
-  const sum = row.bullish + row.neutral + row.bearish;
-  if (row.bullish < 0 || row.bullish > 100 || row.neutral < 0 || row.neutral > 100 || row.bearish < 0 || row.bearish > 100)
-    return { ok: false, reason: "percentage out of range" };
-  if (Math.abs(sum - 100) > 0.8)
-    return { ok: false, reason: `sum ${sum.toFixed(2)} != 100` };
-  return { ok: true };
 }
 
 // ── Shared browser setup ───────────────────────────────────────────────────────
@@ -367,7 +358,7 @@ If you cannot find the sentiment data table, return: {"error": "no data found"}`
   }
 }
 
-// ── Main scraping function (runs all 3 layers) ────────────────────────────────
+// ── Tier 1: Playwright cascade over aaii.com (layers 1-4) ─────────────────────
 export async function scrapeAAII(): Promise<SentRow | null> {
   let browser: Browser | null = null;
 
@@ -415,66 +406,118 @@ export async function scrapeAAII(): Promise<SentRow | null> {
   }
 }
 
-// ── Write results to Google Sheets ────────────────────────────────────────────
-async function writeToSheets(row: SentRow): Promise<void> {
-  const SHEET_ID =
-    process.env.SHEET_ID ?? "1zQQ2am1yhzTwY7nx8xPak4Q0WoNMwxWj7Ekr-fDEIF4";
+// ── Write results to Google Sheets (3 attempts, anti-regression guard, F2 stamp) ──
+const BACKOFFS_MS = [5_000, 15_000, 45_000];
+
+function sheetsClient() {
   const auth = new google.auth.GoogleAuth({
     credentials: JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS!),
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
-  const sheets = google.sheets({ version: "v4", auth });
-  const delta = `${(row.bearish - row.bullish).toFixed(2)}%`;
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: "A2:D2",
-    valueInputOption: "USER_ENTERED",
-    requestBody: {
-      values: [
-        [
-          row.reportedDate,
-          `${row.bullish}%`,
-          `${row.neutral}%`,
-          `${row.bearish}%`,
-        ],
-      ],
-    },
-  });
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: "E2",
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: [[delta]] },
-  });
-  console.log(
-    `Wrote to sheet: ${row.reportedDate} | bull=${row.bullish}% | neu=${row.neutral}% | bear=${row.bearish}% | delta=${delta} | source=${row.source}`
-  );
+  return google.sheets({ version: "v4", auth });
 }
 
-// ── Main workflow ─────────────────────────────────────────────────────────────
-async function runWorkflow() {
-  console.log("Starting AAII sentiment scraper...\n");
+async function writeToSheets(row: SentRow): Promise<void> {
+  const SHEET_ID = process.env.SHEET_ID ?? "1zQQ2am1yhzTwY7nx8xPak4Q0WoNMwxWj7Ekr-fDEIF4";
+  const sheets = sheetsClient();
+  const delta = `${(row.bearish - row.bullish).toFixed(2)}%`;
 
-  const row = await scrapeAAII();
-
-  if (row) {
-    const v = validate(row);
-    if (v.ok) {
-      console.log("\nScraping succeeded:", row);
-      if (process.env.DRY_RUN) {
-        console.log("[DRY_RUN] Skipping sheet write.");
-        return row;
-      }
-      await writeToSheets(row);
-      return row;
-    } else {
-      console.error("Validation failed:", v.reason);
-      throw new Error(`Validation failed: ${v.reason}`);
+  // Anti-regression guard: never clobber a NEWER survey date with an older one
+  // (e.g. a late retry that only reached a lagging backup source). Also decide
+  // whether the F column is ours to stamp (empty or a prior "updated ..." stamp).
+  let stampOk = false;
+  try {
+    const cur = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: "A2:F2" });
+    const vals = cur.data.values?.[0] ?? [];
+    const sheetDate = vals[0] ? parseSurveyDate(String(vals[0])) : null;
+    const newDate = parseSurveyDate(row.reportedDate);
+    if (sheetDate && newDate && sheetDate.getTime() > newDate.getTime()) {
+      console.log(`Sheet already has newer survey (${vals[0]}) than candidate (${row.reportedDate}); skipping write.`);
+      await alert("INFO", `Skipped write: sheet has ${vals[0]}, candidate ${row.reportedDate} (source ${row.source}) is older.`);
+      return;
     }
-  } else {
-    throw new Error("Scraping failed - no data found");
+    stampOk = !vals[5] || /^updated /.test(String(vals[5]));
+  } catch (e: any) {
+    console.log(`Pre-write read failed (continuing to write): ${e.message}`);
   }
+
+  let lastErr: any;
+  for (let attempt = 0; attempt < BACKOFFS_MS.length; attempt++) {
+    try {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: "A2:D2",
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values: [[row.reportedDate, `${row.bullish}%`, `${row.neutral}%`, `${row.bearish}%`]] },
+      });
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: "E2",
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values: [[delta]] },
+      });
+      if (stampOk) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SHEET_ID,
+          range: "F2",
+          valueInputOption: "RAW",
+          requestBody: { values: [[`updated ${new Date().toISOString()} via ${row.source}`]] },
+        }).catch((e: any) => console.log(`F2 stamp failed (non-fatal): ${e.message}`));
+      }
+      console.log(`Wrote to sheet: ${row.reportedDate} | bull=${row.bullish}% | neu=${row.neutral}% | bear=${row.bearish}% | delta=${delta} | source=${row.source}`);
+      return;
+    } catch (e: any) {
+      lastErr = e;
+      console.log(`Sheets write attempt ${attempt + 1}/${BACKOFFS_MS.length} failed: ${e.message}`);
+      if (attempt < BACKOFFS_MS.length - 1) await new Promise((r) => setTimeout(r, BACKOFFS_MS[attempt]));
+    }
+  }
+  await alert("CRITICAL", `Sheets write failed after ${BACKOFFS_MS.length} attempts: ${lastErr?.message}\nDATA (enter manually): ${row.reportedDate} bull=${row.bullish}% neu=${row.neutral}% bear=${row.bearish}% delta=${delta} (source ${row.source})`);
+  throw new Error(`Sheets write failed after retries: ${lastErr?.message}`);
+}
+
+// ── Main workflow: source-tier cascade, first valid + fresh row wins ──────────
+type Tier = { name: string; idx: number; fn: () => Promise<SentRow | null> };
+
+async function runWorkflow() {
+  console.log("Starting AAII sentiment scraper (tiered cascade)...\n");
+  const tiers: Tier[] = [
+    { name: "Tier 0: aaii.com plain HTTP", idx: 0, fn: () => fetchAAIIHttp() },
+    { name: "Tier 1: aaii.com Playwright L1-L4", idx: 1, fn: () => scrapeAAII() },
+    { name: "Tier 2: AAII Substack", idx: 2, fn: () => fetchSubstack() },
+    { name: "Tier 3: YCharts", idx: 3, fn: () => fetchYCharts() },
+  ];
+
+  for (const tier of tiers) {
+    console.log(`\n=== ${tier.name} ===`);
+    let row: SentRow | null = null;
+    try {
+      row = await tier.fn();
+    } catch (e: any) {
+      console.log(`${tier.name} threw (continuing to next tier): ${e.message}`);
+    }
+    if (!row) continue;
+    const v = validate(row);
+    if (!v.ok) {
+      console.log(`${tier.name} row rejected: ${v.reason}`);
+      continue;
+    }
+    if (v.warn) {
+      console.log(`WARN: ${v.warn}`);
+      if (!process.env.DRY_RUN) await alert("INFO", `${v.warn} (source ${row.source})`);
+    }
+    console.log(`\nScraping succeeded via ${tier.name}:`, row);
+    if (process.env.DRY_RUN) {
+      console.log("[DRY_RUN] Skipping sheet write + alerts.");
+      return row;
+    }
+    if (tier.idx >= 2) {
+      await alert("INFO", `Primary aaii.com path failed; used backup ${row.source} (${row.reportedDate} ${row.bullish}/${row.neutral}/${row.bearish}). aaii.com may be blocking or broken — worth a look.`);
+    }
+    await writeToSheets(row);
+    return row;
+  }
+  throw new Error("All tiers failed - no valid fresh data from any source");
 }
 
 // Only run when invoked directly (not when imported by tests)
