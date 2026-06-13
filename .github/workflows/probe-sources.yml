@@ -1,0 +1,32 @@
+name: Probe Sources
+# Dispatch-only diagnostic: curls every candidate source from a real GitHub
+# Actions datacenter IP and reports HTTP status + whether the extraction regex
+# matches. This is the one thing local probes can't prove — datacenter-IP access.
+# status=200 + pattern hits => tier viable from CI. 403/503/000 => blocked here.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe all candidate sources
+        run: |
+          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          probe () {
+            name="$1"; url="$2"; pattern="$3"
+            body=$(curl -sL --max-time 20 -A "$UA" \
+              -H "Accept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -w "\n__HTTP_STATUS__%{http_code}" "$url" || echo "__HTTP_STATUS__000")
+            status="${body##*__HTTP_STATUS__}"
+            matches=$(printf '%s' "$body" | grep -oE "$pattern" | head -3 | tr '\n' ' ')
+            echo "[$name] status=$status pattern_hits='${matches:-NONE}'"
+          }
+          probe "aaii-direct"      "https://www.aaii.com/sentimentsurvey/sent_results"            "[A-Z][a-z]{2} +[0-9]{1,2}</td>|[0-9]+\.[0-9]%"
+          probe "substack-archive" "https://insights.aaii.com/api/v1/archive?sort=new&limit=12"   "\"slug\":\"[a-z0-9-]+\""
+          probe "substack-rss"     "https://insights.aaii.com/feed"                               "<title>[^<]*[Ss]entiment[^<]*</title>"
+          probe "ycharts-bullish"  "https://ycharts.com/indicators/us_investor_sentiment_bullish" "is at [0-9.]+%"
+          probe "ycharts-neutral"  "https://ycharts.com/indicators/us_investor_sentiment_neutral" "is at [0-9.]+%"
+          probe "ycharts-bearish"  "https://ycharts.com/indicators/us_investor_sentiment_bearish" "is at [0-9.]+%"
+          echo "Done. status=200 + pattern hits = tier viable from GHA. 403/503/000 = blocked."
