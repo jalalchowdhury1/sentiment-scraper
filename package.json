@@ -1,11 +1,13 @@
 {
-  "name": "my-demo-project",
+  "name": "sentiment-scraper",
   "version": "1.0.0",
-  "description": "",
-  "main": "test.js",
+  "description": "Daily AAII Investor Sentiment Survey scraper with cascading source fallbacks -> Google Sheets.",
+  "main": "sentiment-scraper.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "scrape:aaii": "ts-node sentiment-scraper.ts"
+    "test": "ts-node test-validate.ts && ts-node test-sources-offline.ts && ts-node quick-test.ts",
+    "test:tiers": "ts-node test-tiers.ts",
+    "scrape:aaii": "ts-node sentiment-scraper.ts",
+    "watchdog": "ts-node watchdog.ts"
   },
   "keywords": [],
   "author": "",

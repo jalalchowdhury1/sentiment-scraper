@@ -17,7 +17,7 @@ jobs:
           node-version: '22'
       - run: npm ci
       - run: node node_modules/playwright/cli.js install --with-deps chromium
-      - run: npx ts-node test-layers.ts
+      - run: npx ts-node test-tiers.ts
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 

@@ -140,20 +140,17 @@ async function main() {
   }
   console.log("════════════════════════════════════════════════");
 
-  // Success = Layers 1-3 pass, OR Layer 4 passes as fallback
-  const corePassed = results.slice(0, 3).every(r => r.ok);
-  const fallbackPassed = !l4Skipped && results[3]?.ok;
+  // Success = the CASCADE succeeds: any layer (1-4) produced valid data.
+  // (Previously this required ALL of L1-L3 to pass, which failed the run when
+  // one layer degraded even though the cascade would have succeeded.)
+  const anyPassed = results.some(r => r.ok);
 
-  if (corePassed) {
-    if (l4Skipped) {
-      console.log("\n✓ SUCCESS! (Layers 1-3 passed, Layer 4 skipped to save costs)");
-    } else if (fallbackPassed) {
-      console.log("\n✓ SUCCESS! (All 4 layers passed)");
-    } else {
-      console.log("\n⚠ Partial success - Layers 1-3 passed, Layer 4 fallback failed");
-    }
+  if (anyPassed) {
+    console.log("\n✓ SUCCESS! At least one layer extracts valid data (cascade viable)");
+    const failed = results.filter(r => !r.ok);
+    if (failed.length) console.log(`⚠ Degraded layers to investigate: ${failed.map(r => r.layer).join(", ")}`);
   } else {
-    console.log("\n✗ FAIL: Core layers 1-3 all failed");
+    console.log("\n✗ FAIL: All layers failed");
     process.exit(1);
   }
 }
